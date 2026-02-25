@@ -1,0 +1,398 @@
+#anki-example-panel {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.25);
+  z-index: 2147483646;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.anki-panel {
+  background: #fff;
+  min-width: 360px;
+  max-width: 520px;
+  padding: 16px;
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  color: #1f2933;
+}
+
+.anki-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.anki-panel__title {
+  font-weight: 600;
+  font-size: 16px;
+}
+
+.anki-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.anki-field input,
+.anki-field textarea {
+  width: 100%;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: #111;
+  box-sizing: border-box;
+  outline: none;
+}
+
+.anki-field textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.anki-phrase-status {
+  margin-top: -4px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.anki-phrase-status.is-error {
+  color: #b91c1c;
+}
+
+.anki-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.anki-btn {
+  border: 1px solid #d0d7de;
+  background: #fff;
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.anki-btn--primary {
+  background: #2563eb;
+  color: #fff;
+  border-color: #2563eb;
+}
+
+.anki-btn--primary:hover {
+  background: #1e4fc4;
+}
+
+.anki-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.anki-btn--ghost {
+  background: transparent;
+}
+
+.anki-hint {
+  margin-top: 10px;
+  color: #52616b;
+  font-size: 12px;
+}
+
+.anki-toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: #111827;
+  color: #fff;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  opacity: 0;
+  transform: translateY(10px);
+  transition: all 0.2s ease;
+  z-index: 2147483647;
+}
+
+.anki-toast.active {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+#deepseek-meaning-panel {
+  position: fixed;
+  z-index: 2147483646;
+  width: min(390px, 92vw);
+  max-height: 80vh;
+  overflow: auto;
+  background: #fff;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  padding: 10px 12px;
+  color: #0f172a;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+#deepseek-meaning-panel .deepseek-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  cursor: move;
+  user-select: none;
+}
+
+#deepseek-meaning-panel .deepseek-panel__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1f2937;
+}
+
+#deepseek-meaning-panel .deepseek-panel__word {
+  font-size: 14px;
+  font-weight: 600;
+  color: #111827;
+}
+
+#deepseek-meaning-panel .deepseek-panel__sentence {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result {
+  margin-top: 8px;
+  padding: 8px;
+  background: #f8fafc;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  color: #0f172a;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result--meaning {
+  position: relative;
+  padding: 12px 10px 10px 12px;
+  border: 1px solid #bfdbfe;
+  border-left: 4px solid #2563eb;
+  background: linear-gradient(180deg, #f0f7ff 0%, #f8fbff 100%);
+  box-shadow: 0 6px 14px rgba(37, 99, 235, 0.08);
+  font-size: 14px;
+  line-height: 1.55;
+  color: #0f172a;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result--meaning::before {
+  content: "上下文释义";
+  display: inline-block;
+  margin-bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result.is-error {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result--meaning.is-error {
+  border-color: #fecaca;
+  border-left-color: #ef4444;
+  box-shadow: none;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result.is-muted {
+  color: #94a3b8;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result--meaning.is-muted {
+  border-color: #dbeafe;
+  border-left-color: #93c5fd;
+  background: #f8fbff;
+  box-shadow: none;
+  color: #64748b;
+}
+
+#deepseek-meaning-panel .deepseek-panel__result:empty {
+  display: none;
+}
+
+#deepseek-meaning-panel .deepseek-panel__actions {
+  display: grid;
+  margin-top: 8px;
+  gap: 6px;
+}
+
+#deepseek-meaning-panel .deepseek-panel__action-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn {
+  border: 1px solid #2563eb;
+  background: #2563eb;
+  color: #fff;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn--secondary {
+  border-color: #cbd5f5;
+  background: #f8fafc;
+  color: #334155;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn--secondary:hover {
+  background: #e2e8f0;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn--warning {
+  border-color: #f59e0b;
+  background: #f59e0b;
+  color: #fff;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn--warning:hover {
+  background: #d97706;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn:not(.deepseek-action-btn--secondary):not(.deepseek-action-btn--warning):hover {
+  background: #1e4fc4;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn--audio {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+#deepseek-meaning-panel .deepseek-action-btn__icon {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+}
+
+#deepseek-meaning-panel .deepseek-btn {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  color: #6b7280;
+  padding: 2px 4px;
+}
+
+#deepseek-meaning-panel .deepseek-btn:hover {
+  color: #111827;
+}
+
+#deepseek-meaning-panel .parse-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#deepseek-meaning-panel .parse-sentence {
+  background: #f8fafc;
+  border: 1px dashed #e2e8f0;
+  border-radius: 6px;
+  padding: 6px 8px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  color: #0f172a;
+  font-size: 12px;
+}
+
+#deepseek-meaning-panel .parse-token {
+  border-bottom: 2px solid var(--parse-color, #94a3b8);
+  padding: 0 1px;
+}
+
+#deepseek-meaning-panel .parse-role-subject {
+  --parse-color: #ef4444;
+}
+
+#deepseek-meaning-panel .parse-role-verb {
+  --parse-color: #3b82f6;
+}
+
+#deepseek-meaning-panel .parse-role-object {
+  --parse-color: #22c55e;
+}
+
+#deepseek-meaning-panel .parse-role-complement {
+  --parse-color: #f59e0b;
+}
+
+#deepseek-meaning-panel .parse-role-attrib {
+  --parse-color: #a855f7;
+}
+
+#deepseek-meaning-panel .parse-role-adverbial {
+  --parse-color: #ec4899;
+}
+
+#deepseek-meaning-panel .parse-role-clause {
+  --parse-color: #0ea5e9;
+}
+
+#deepseek-meaning-panel .parse-role-conj {
+  --parse-color: #64748b;
+}
+
+#deepseek-meaning-panel .parse-role-other {
+  --parse-color: #94a3b8;
+}
+
+#deepseek-meaning-panel .parse-notes {
+  margin: 0;
+  padding-left: 16px;
+  color: #475569;
+  font-size: 12px;
+}
+
+#deepseek-meaning-panel .parse-notes li {
+  margin: 4px 0;
+}
+
+#deepseek-meaning-panel .parse-translation {
+  background: #f1f5f9;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+#deepseek-meaning-panel .parse-label {
+  font-size: 11px;
+  color: #64748b;
+  margin-bottom: 2px;
+}
+
+#deepseek-meaning-panel .parse-text {
+  font-size: 12px;
+  color: #0f172a;
+}

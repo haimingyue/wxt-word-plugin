@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>设置 - Anki Example Collector</title>
+    
+  </head>
+  <body>
+    <main class="options">
+      <header>
+        <h1>设置</h1>
+        <p>配置 Anki 牌组 / 模板 / 字段名</p>
+      </header>
+
+      <form id="config-form">
+        <label>
+          <span>Deck 名</span>
+          <div class="field-with-select">
+            <input name="deck" readonly required />
+            <select data-deck-select="deck"></select>
+          </div>
+        </label>
+        <label>
+          <span>Model 名</span>
+          <div class="field-with-select">
+            <input name="model" readonly required />
+            <select data-model-select="model"></select>
+          </div>
+        </label>
+        <label>
+          <span>Word 字段</span>
+          <div class="field-with-select">
+            <input name="wordField" readonly required />
+            <select data-field-select="wordField" data-field-list="main-field-options"></select>
+          </div>
+        </label>
+        <label>
+          <span>Example 字段</span>
+          <div class="field-with-select">
+            <input name="exampleField" readonly required />
+            <select
+              data-field-select="exampleField"
+              data-field-list="main-field-options"
+            ></select>
+          </div>
+        </label>
+        <label>
+          <span>Source 字段（可空）</span>
+          <div class="field-with-select">
+            <input name="sourceField" readonly />
+            <select data-field-select="sourceField" data-field-list="main-field-options"></select>
+          </div>
+        </label>
+
+        <section class="section">
+          <h2>短语配置</h2>
+          <p class="section__hint">短语卡片字段：Phrase / Reason / Examples</p>
+          <label>
+            <span>短语 Deck 名</span>
+            <div class="field-with-select">
+              <input name="phraseDeck" readonly required />
+              <select data-deck-select="phraseDeck"></select>
+            </div>
+          </label>
+          <label>
+            <span>短语 Model 名</span>
+            <div class="field-with-select">
+              <input name="phraseModel" readonly required />
+              <select data-model-select="phraseModel"></select>
+            </div>
+          </label>
+          <label>
+            <span>短语字段</span>
+            <div class="field-with-select">
+              <input name="phraseField" readonly required />
+              <select data-field-select="phraseField" data-field-list="phrase-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>Reason 字段</span>
+            <div class="field-with-select">
+              <input name="reasonField" readonly required />
+              <select data-field-select="reasonField" data-field-list="phrase-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>Examples 字段</span>
+            <div class="field-with-select">
+              <input name="examplesField" readonly required />
+              <select data-field-select="examplesField" data-field-list="phrase-field-options"></select>
+            </div>
+          </label>
+        </section>
+
+        <section class="section">
+          <h2>生词本配置</h2>
+          <p class="section__hint">
+            生词本字段：word / phonetic / definition / translation / pos / collins / oxford /
+            tag / bnc / frq / exchange / detail / audio
+          </p>
+          <label>
+            <span>生词本 Deck 名</span>
+            <div class="field-with-select">
+              <input name="vocabDeck" readonly required />
+              <select data-deck-select="vocabDeck"></select>
+            </div>
+          </label>
+          <label>
+            <span>生词本 Model 名</span>
+            <div class="field-with-select">
+              <input name="vocabModel" readonly required />
+              <select data-model-select="vocabModel"></select>
+            </div>
+          </label>
+          <label>
+            <span>word（词）字段</span>
+            <div class="field-with-select">
+              <input name="vocabWordField" readonly required />
+              <select data-field-select="vocabWordField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>phonetic（音标）字段</span>
+            <div class="field-with-select">
+              <input name="vocabPhoneticField" readonly required />
+              <select data-field-select="vocabPhoneticField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>definition（英文释义）字段</span>
+            <div class="field-with-select">
+              <input name="vocabDefinitionField" readonly required />
+              <select data-field-select="vocabDefinitionField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>translation（中文释义）字段</span>
+            <div class="field-with-select">
+              <input name="vocabTranslationField" readonly required />
+              <select data-field-select="vocabTranslationField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>pos（词性分布）字段</span>
+            <div class="field-with-select">
+              <input name="vocabPosField" readonly required />
+              <select data-field-select="vocabPosField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>collins（柯林斯星级）字段</span>
+            <div class="field-with-select">
+              <input name="vocabCollinsField" readonly required />
+              <select data-field-select="vocabCollinsField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>oxford（牛津 3000）字段</span>
+            <div class="field-with-select">
+              <input name="vocabOxfordField" readonly required />
+              <select data-field-select="vocabOxfordField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>tag（考试标签）字段</span>
+            <div class="field-with-select">
+              <input name="vocabTagField" readonly required />
+              <select data-field-select="vocabTagField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>bnc（词频）字段</span>
+            <div class="field-with-select">
+              <input name="vocabBncField" readonly required />
+              <select data-field-select="vocabBncField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>frq（词频）字段</span>
+            <div class="field-with-select">
+              <input name="vocabFrqField" readonly required />
+              <select data-field-select="vocabFrqField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>exchange（词形变化）字段</span>
+            <div class="field-with-select">
+              <input name="vocabExchangeField" readonly required />
+              <select data-field-select="vocabExchangeField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>detail（扩展）字段</span>
+            <div class="field-with-select">
+              <input name="vocabDetailField" readonly required />
+              <select data-field-select="vocabDetailField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>audio（音频）字段</span>
+            <div class="field-with-select">
+              <input name="vocabAudioField" readonly required />
+              <select data-field-select="vocabAudioField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+          <label>
+            <span>example（例句）字段</span>
+            <div class="field-with-select">
+              <input name="vocabExampleField" readonly required />
+              <select data-field-select="vocabExampleField" data-field-list="vocab-field-options"></select>
+            </div>
+          </label>
+        </section>
+
+        <section class="section">
+          <h2>账号登录（VIP 免 Key）</h2>
+          <p class="section__hint">
+            登录 extra-word 账号后，VIP 用户会优先走后端代理获取释义和句子解析，无需本地配置 DeepSeek Key。
+          </p>
+          <label>
+            <span>后端地址</span>
+            <input
+              name="backendBaseUrl"
+              readonly
+              placeholder="http://47.120.34.161:8088"
+            />
+          </label>
+          <label>
+            <span>用户名</span>
+            <input name="backendUsername" autocomplete="username" placeholder="请输入用户名" />
+          </label>
+          <label>
+            <span>密码</span>
+            <input
+              name="backendPassword"
+              type="password"
+              autocomplete="current-password"
+              placeholder="请输入密码"
+            />
+          </label>
+          <div class="auth-actions">
+            <button type="button" id="btn-login">登录账号</button>
+            <button type="button" id="btn-logout" class="btn-secondary">退出登录</button>
+          </div>
+          <div id="auth-status" class="status">账号状态：未登录</div>
+        </section>
+
+        <section class="section">
+          <h2>DeepSeek 释义</h2>
+          <p class="section__hint">
+            已登录 VIP 时优先走后端代理；未登录或非 VIP 时可使用你自己的 DeepSeek API Key。
+          </p>
+          <label>
+            <span>DeepSeek API Key</span>
+            <input name="deepseekApiKey" type="password" placeholder="sk-..." />
+          </label>
+          <label>
+            <span>DeepSeek 模型</span>
+            <input name="deepseekModel" placeholder="deepseek-chat" />
+          </label>
+          <label>
+            <span>DeepSeek 官方接口地址</span>
+            <input
+              name="deepseekEndpoint"
+              readonly
+              placeholder="https://api.deepseek.com/v1/chat/completions"
+            />
+          </label>
+        </section>
+
+        <div class="actions">
+          <button type="submit">保存</button>
+          <button type="button" id="btn-load-anki">加载 Anki 列表</button>
+          <button type="button" id="btn-ping">测试 AnkiConnect</button>
+        </div>
+        <div id="status" class="status">未保存</div>
+      </form>
+    </main>
+
+    <datalist id="deck-options"></datalist>
+    <datalist id="model-options"></datalist>
+    <datalist id="main-field-options"></datalist>
+    <datalist id="phrase-field-options"></datalist>
+    <datalist id="vocab-field-options"></datalist>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
+

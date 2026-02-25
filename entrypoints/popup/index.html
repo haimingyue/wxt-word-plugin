@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Anki Example Collector</title>
+    
+  </head>
+  <body>
+    <main class="popup">
+      <h1>Anki Example Collector</h1>
+      <p class="desc">选中单词后按 Ctrl+Shift+L 或右键发送句子到 Anki。</p>
+
+      <div class="actions">
+        <button id="btn-options">打开设置</button>
+        <button id="btn-ping">测试 AnkiConnect</button>
+      </div>
+
+      <div id="status" class="status">状态：等待操作</div>
+      <div class="hint">默认字段：Word / Example / Source，牌组选 Default，模板 Basic。</div>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
+
+
+
