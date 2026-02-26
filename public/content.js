@@ -24,6 +24,7 @@ const YT_CAPTION_BRIDGE_FETCH_TIMEOUT_MS = 4200;
 const YT_PAGE_FETCH_BACKOFF_MS = [400, 900, 1800];
 const YT_PERF_SCAN_DELAYS_MS = [500, 1000, 2000];
 const YT_RT_AD_RETRY_MS = 1500;
+const YT_RT_HTML_RETRY_COOLDOWN_MS = 6000;
 /**
  * Message protocol:
  * `YT_SUBTITLE_FETCH_REQUEST`: content -> injected(main world)
@@ -64,6 +65,7 @@ let ytCaptionBridgeInjecting = null;
 let ytCaptionBridgeReady = false;
 let ytCaptionLastTrack = null;
 let ytCaptionBridgeFetchSeq = 0;
+const ytRtHtmlRetryAtByVideo = new Map();
 
 let meaningRequestId = 0;
 let translationRequestId = 0;
@@ -1606,6 +1608,7 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtAutoCcTriedVideoKey = '';
     ytRtLoadingPromise = null;
     ytRtNextLoadAt = 0;
+    ytRtHtmlRetryAtByVideo.clear();
     ytRtPlayerResponseCache.clear();
     ytRtCaptionTrackCache.clear();
     ytRtTranslationJobId += 1;
@@ -2282,25 +2285,21 @@ async function tryLoadSubtitlesViaBridgeFallback(videoKey, track, fallbackUrl) {
   for (const baseUrl of baseUrls) {
     const candidates = [buildCaptionVttUrl(baseUrl), buildCaptionJsonUrl(baseUrl)];
     for (const requestUrl of candidates) {
-      const response = await requestSubtitleTextViaBridge(requestUrl);
-      if (!response) {
-        console.warn('[yt-cc] bridge fallback timeout', {
-          videoKey,
-          timedtext: getTimedtextUrlSummary(requestUrl)
-        });
-        continue;
-      }
-      const head = String(response.text || '').slice(0, 160);
+      const attempts = [];
+      const format = requestUrl.includes('fmt=vtt') ? 'vtt' : 'json3';
+      const result = await fetchSubtitleWithBridgeRetry(requestUrl, format, attempts);
+      const lastAttempt = attempts[attempts.length - 1] || null;
       console.info('[yt-cc] bridge fallback fetch', {
         videoKey,
-        status: Number(response.status || 0),
-        ct: String(response.contentType || ''),
-        timedtext: getTimedtextUrlSummary(requestUrl),
-        head
+        format,
+        ok: Boolean(result?.ok),
+        status: Number(lastAttempt?.status || 0),
+        ct: String(lastAttempt?.contentType || ''),
+        reason: String(lastAttempt?.reason || ''),
+        timedtext: getTimedtextUrlSummary(requestUrl)
       });
-      if (!response.ok || Number(response.status || 0) !== 200) continue;
-      if (isLikelyHtmlResponse(response.contentType, response.text)) continue;
-      const events = parseCaptionEventsFromText(response.text);
+      if (!result?.ok || !result?.body) continue;
+      const events = parseCaptionEventsFromText(result.body);
       const items = buildRealtimeItemsFromCaptionEvents(events, videoKey);
       if (items.length) {
         return items;
@@ -3004,6 +3003,21 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
         videoKey,
         status
       });
+      const now = Date.now();
+      const lastRetryAt = Number(ytRtHtmlRetryAtByVideo.get(videoKey) || 0);
+      if (now - lastRetryAt > YT_RT_HTML_RETRY_COOLDOWN_MS) {
+        ytRtHtmlRetryAtByVideo.set(videoKey, now);
+        console.info('[yt-cc] scheduling one refresh retry after html response', {
+          videoKey
+        });
+        ytRtStatusText = '字幕源暂时异常，正在自动重试...';
+        ytRtNextLoadAt = now + 900;
+        renderRealtimeSubtitleList();
+        window.setTimeout(() => {
+          loadRealtimeTranscript(true);
+        }, 900);
+        return;
+      }
     }
 
     if (status === 'HTML_RESPONSE') {
