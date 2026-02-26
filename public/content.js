@@ -11,6 +11,7 @@ const YT_RT_WATCH_ACTIVE_CLASS = 'yt-rt-vertical-view-active';
 const YT_RT_TARGET_FULL_CLASS = 'yt-rt-target-full-bleed';
 const YT_RT_TARGET_PLAYER_FULL_CLASS = 'yt-rt-target-player-full-bleed';
 const YT_RT_TARGET_PLAYER_CONTAINER_CLASS = 'yt-rt-target-player-container';
+const YT_RT_HIDE_NATIVE_CAPTIONS_CLASS = 'yt-rt-hide-native-captions';
 const YT_RT_MAX_ITEMS = 2000;
 const YT_RT_DEBOUNCE_MS = 120;
 const YT_RT_SEEK_LEAD_SECONDS = 1.0;
@@ -25,6 +26,8 @@ const YT_PAGE_FETCH_BACKOFF_MS = [400, 900, 1800];
 const YT_PERF_SCAN_DELAYS_MS = [500, 1000, 2000];
 const YT_RT_AD_RETRY_MS = 1500;
 const YT_RT_HTML_RETRY_COOLDOWN_MS = 6000;
+const YT_RT_HTML_HARD_COOLDOWN_MS = 30000;
+const YT_RT_OVERLAY_POS_KEY = 'yt-rt-overlay-pos-v1';
 /**
  * Message protocol:
  * `YT_SUBTITLE_FETCH_REQUEST`: content -> injected(main world)
@@ -49,6 +52,7 @@ let ytRtActiveIndex = -1;
 let ytRtPlaybackTimer = 0;
 let ytRtTranscriptLoadedVideoKey = '';
 let ytRtTranscriptLoadingVideoKey = '';
+let ytRtFullTranscriptTriedVideoKey = '';
 let ytRtTranslationJobId = 0;
 let ytRtCanTranslate = null;
 let ytRtAutoCcTriedVideoKey = '';
@@ -66,6 +70,9 @@ let ytCaptionBridgeReady = false;
 let ytCaptionLastTrack = null;
 let ytCaptionBridgeFetchSeq = 0;
 const ytRtHtmlRetryAtByVideo = new Map();
+const ytRtSubtitleBlockedUntilByVideo = new Map();
+let ytRtOverlayPos = null;
+let ytRtOverlayDragBound = false;
 
 let meaningRequestId = 0;
 let translationRequestId = 0;
@@ -1605,10 +1612,12 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtStatusText = '加载字幕中...';
     ytRtTranscriptLoadedVideoKey = '';
     ytRtTranscriptLoadingVideoKey = '';
+    ytRtFullTranscriptTriedVideoKey = '';
     ytRtAutoCcTriedVideoKey = '';
     ytRtLoadingPromise = null;
     ytRtNextLoadAt = 0;
     ytRtHtmlRetryAtByVideo.clear();
+    ytRtSubtitleBlockedUntilByVideo.clear();
     ytRtPlayerResponseCache.clear();
     ytRtCaptionTrackCache.clear();
     ytRtTranslationJobId += 1;
@@ -1640,6 +1649,8 @@ function syncRealtimePanelLayout() {
     if (panel.parentElement !== document.body) {
       document.body.appendChild(panel);
     }
+    syncNativeCaptionVisibility();
+    syncRealtimeOverlayLayout();
     return;
   }
   const fullBleedContainer = document.getElementById('full-bleed-container');
@@ -1662,12 +1673,16 @@ function syncRealtimePanelLayout() {
     } else {
       watchFlexy?.classList?.add(YT_RT_TARGET_PLAYER_CONTAINER_CLASS);
     }
+    syncNativeCaptionVisibility();
+    syncRealtimeOverlayLayout();
     return;
   }
 
   if (panel.parentElement !== document.body) {
     document.body.appendChild(panel);
   }
+  syncNativeCaptionVisibility();
+  syncRealtimeOverlayLayout();
 }
 
 function teardownRealtimeSubtitleObserver() {
@@ -1687,8 +1702,133 @@ function teardownRealtimeSubtitleObserver() {
       YT_RT_WATCH_ACTIVE_CLASS,
       YT_RT_TARGET_FULL_CLASS,
       YT_RT_TARGET_PLAYER_FULL_CLASS,
-      YT_RT_TARGET_PLAYER_CONTAINER_CLASS
+      YT_RT_TARGET_PLAYER_CONTAINER_CLASS,
+      YT_RT_HIDE_NATIVE_CAPTIONS_CLASS
     );
+}
+
+function syncNativeCaptionVisibility() {
+  const watchFlexy = document.querySelector('ytd-watch-flexy');
+  const panel = document.getElementById(YT_RT_PANEL_ID);
+  const shouldHideNative =
+    Boolean(watchFlexy) &&
+    Boolean(panel) &&
+    !panel.classList.contains('is-hidden') &&
+    ytRtEnabled === true;
+  watchFlexy?.classList?.toggle(YT_RT_HIDE_NATIVE_CAPTIONS_CLASS, shouldHideNative);
+}
+
+function getRealtimeOverlayAnchorContainer() {
+  return (
+    document.getElementById('movie_player') ||
+    document.getElementById('player-full-bleed-container') ||
+    document.getElementById('full-bleed-container') ||
+    document.getElementById('player-container-outer') ||
+    document.getElementById('player') ||
+    null
+  );
+}
+
+function getRealtimeOverlayPos() {
+  if (ytRtOverlayPos) return ytRtOverlayPos;
+  try {
+    const raw = localStorage.getItem(YT_RT_OVERLAY_POS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      const x = Number(parsed?.xPct);
+      const y = Number(parsed?.yPct);
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        ytRtOverlayPos = {
+          xPct: Math.min(95, Math.max(5, x)),
+          yPct: Math.min(95, Math.max(5, y))
+        };
+        return ytRtOverlayPos;
+      }
+    }
+  } catch (_) {}
+  ytRtOverlayPos = { xPct: 50, yPct: 84 };
+  return ytRtOverlayPos;
+}
+
+function setRealtimeOverlayPos(nextPos, persist = true) {
+  const x = Number(nextPos?.xPct);
+  const y = Number(nextPos?.yPct);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  ytRtOverlayPos = {
+    xPct: Math.min(95, Math.max(5, x)),
+    yPct: Math.min(95, Math.max(5, y))
+  };
+  if (persist) {
+    try {
+      localStorage.setItem(YT_RT_OVERLAY_POS_KEY, JSON.stringify(ytRtOverlayPos));
+    } catch (_) {}
+  }
+}
+
+function applyRealtimeOverlayPos() {
+  const overlay = document.getElementById(YT_RT_OVERLAY_ID);
+  if (!overlay) return;
+  const pos = getRealtimeOverlayPos();
+  overlay.style.left = `${pos.xPct}%`;
+  overlay.style.top = `${pos.yPct}%`;
+}
+
+function syncRealtimeOverlayLayout() {
+  const overlay = document.getElementById(YT_RT_OVERLAY_ID);
+  if (!overlay) return;
+  const container = getRealtimeOverlayAnchorContainer();
+  if (container && overlay.parentElement !== container) {
+    if (window.getComputedStyle(container).position === 'static') {
+      container.style.position = 'relative';
+    }
+    overlay.remove();
+    container.appendChild(overlay);
+  } else if (!container && overlay.parentElement !== document.body) {
+    overlay.remove();
+    document.body.appendChild(overlay);
+  }
+  applyRealtimeOverlayPos();
+}
+
+function enableRealtimeOverlayDrag(overlay) {
+  if (!overlay || ytRtOverlayDragBound) return;
+  const handle = overlay.querySelector('[data-yt-rt-overlay-drag]');
+  if (!handle) return;
+  ytRtOverlayDragBound = true;
+
+  let dragging = false;
+  let boundRect = null;
+  const onPointerMove = (event) => {
+    if (!dragging || !boundRect) return;
+    const xPct = ((event.clientX - boundRect.left) / Math.max(1, boundRect.width)) * 100;
+    const yPct = ((event.clientY - boundRect.top) / Math.max(1, boundRect.height)) * 100;
+    setRealtimeOverlayPos({ xPct, yPct }, false);
+    applyRealtimeOverlayPos();
+  };
+  const onPointerUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    overlay.classList.remove('is-dragging');
+    setRealtimeOverlayPos(getRealtimeOverlayPos(), true);
+    document.removeEventListener('pointermove', onPointerMove);
+    document.removeEventListener('pointerup', onPointerUp);
+  };
+
+  handle.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const container = overlay.parentElement;
+    if (!container) return;
+    event.preventDefault();
+    boundRect = container.getBoundingClientRect();
+    dragging = true;
+    overlay.classList.add('is-dragging');
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', onPointerUp);
+  });
+
+  window.addEventListener('resize', () => {
+    applyRealtimeOverlayPos();
+  });
 }
 
 function isYouTubeRuntimePage() {
@@ -2881,21 +3021,9 @@ async function translateRealtimeItems(videoKey) {
 }
 
 function loadRealtimeTranscript(forceReload = false) {
-  if (!forceReload && Date.now() < ytRtNextLoadAt) {
-    return Promise.resolve();
-  }
-  if (forceReload) {
-    ytRtNextLoadAt = 0;
-    ytRtLoadingPromise = ensureRealtimeTranscriptLoaded(true).finally(() => {
-      ytRtLoadingPromise = null;
-    });
-    return ytRtLoadingPromise;
-  }
-  if (!ytRtLoadingPromise) {
-    ytRtLoadingPromise = ensureRealtimeTranscriptLoaded(false).finally(() => {
-      ytRtLoadingPromise = null;
-    });
-  }
+  ytRtLoadingPromise = ensureRealtimeTranscriptLoaded(Boolean(forceReload)).finally(() => {
+    ytRtLoadingPromise = null;
+  });
   return ytRtLoadingPromise;
 }
 
@@ -2903,192 +3031,38 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   const videoKey = getCurrentYouTubeVideoKey();
   if (!videoKey) return;
   if (forceReload) {
-    ytRtNextLoadAt = 0;
-    ytRtTranscriptLoadedVideoKey = '';
-    ytRtTranscriptLoadingVideoKey = '';
-    ytRtTranslationJobId += 1;
-    ytRtActiveItemId = '';
-    ytRtActiveIndex = -1;
+    ytRtLastCaption = '';
+    ytRtFullTranscriptTriedVideoKey = '';
   }
-  if (!forceReload && ytRtTranscriptLoadedVideoKey === videoKey && ytRtItems.length) return;
-  if (!forceReload && ytRtTranscriptLoadingVideoKey === videoKey) return;
+  if (isYouTubeAdPlaying()) {
+    ytRtStatusText = '广告播放中，广告结束后自动读取字幕...';
+    if (!ytRtItems.length) renderRealtimeSubtitleList();
+    return;
+  }
+  ytRtTranscriptLoadedVideoKey = videoKey;
+  await ensureRealtimeTranslationCapability();
 
-  ytRtTranscriptLoadingVideoKey = videoKey;
-  ytRtStatusText = '加载字幕中...';
-  renderRealtimeSubtitleList();
-  try {
-    if (isYouTubeAdPlaying()) {
-      ytRtItems = [];
-      ytRtStatusText = '广告播放中，广告结束后自动加载字幕...';
-      ytRtTranscriptLoadedVideoKey = '';
-      ytRtNextLoadAt = Date.now() + YT_RT_AD_RETRY_MS;
-      renderRealtimeSubtitleList();
-      window.setTimeout(() => {
-        loadRealtimeTranscript(false);
-      }, YT_RT_AD_RETRY_MS + 120);
-      return;
-    }
-    if (ytRtStatusText.includes('广告播放中')) {
-      ytRtStatusText = '广告已结束，正在加载字幕...';
-      ytRtNextLoadAt = 0;
-      renderRealtimeSubtitleList();
-    }
-
-    const track = await requestCaptionTrackFromBridge(videoKey);
-    let fallbackUrl = '';
-    if (!track?.baseUrl) {
-      fallbackUrl = await findTimedtextUrlFromPerformanceWithRetry(videoKey);
-    }
-    const pageContext = await buildPageContextPayload(videoKey, track, fallbackUrl);
-    console.info('[yt-cc] subtitle request', {
-      videoKey,
-      track: summarizeBridgeTrackForLog(track),
-      fallbackFound: Boolean(fallbackUrl),
-      fallbackTimedtext: fallbackUrl ? getTimedtextUrlSummary(fallbackUrl) : null,
-      pageContext: {
-        source: pageContext?.source || '',
-        candidateCount: Array.isArray(pageContext?.candidates) ? pageContext.candidates.length : 0,
-        attemptCount: Array.isArray(pageContext?.attempts) ? pageContext.attempts.length : 0,
-        htmlReason: String(pageContext?.htmlReason || '')
-      }
-    });
-
-    if (!track?.baseUrl && !fallbackUrl && ytRtAutoCcTriedVideoKey !== videoKey) {
-      console.warn('[yt-cc] subtitle track missing, will auto-enable CC and retry', {
-        videoKey,
-        trackStatus: String(track?.status || '').trim()
-      });
-      ytRtAutoCcTriedVideoKey = videoKey;
-      ensureYouTubeCcEnabled();
-      ytRtStatusText = '正在开启 CC 并加载字幕...';
-      renderRealtimeSubtitleList();
-      window.setTimeout(() => {
-        loadRealtimeTranscript(true);
-      }, 600);
-      return;
-    }
-
-    const subtitleBundle = await requestSubtitleBundle(videoKey, track, fallbackUrl, pageContext);
-    const status = String(subtitleBundle?.status || '').toUpperCase();
-    const itemCount = Array.isArray(subtitleBundle?.items) ? subtitleBundle.items.length : 0;
-    console.info('[yt-cc] subtitle response', {
-      videoKey,
-      status,
-      message: String(subtitleBundle?.message || ''),
-      language: String(subtitleBundle?.language || ''),
-      isAutoGenerated: Boolean(subtitleBundle?.isAutoGenerated),
-      itemCount,
-      debug: subtitleBundle?.debug || null
-    });
-
-    const shouldTryBridgeFallback =
-      isSubtitleBundleHtmlFailure(subtitleBundle) &&
-      (status === 'NO_SUBTITLES' || status === 'HTML_RESPONSE');
-    if (shouldTryBridgeFallback) {
-      console.warn('[yt-cc] background returned HTML, trying page-context fallback', {
-        videoKey,
-        status,
-        debug: subtitleBundle?.debug || null
-      });
-      const fallbackItems = await tryLoadSubtitlesViaBridgeFallback(videoKey, track, fallbackUrl);
-      if (fallbackItems.length) {
-        console.info('[yt-cc] page-context fallback succeeded', {
-          videoKey,
-          itemCount: fallbackItems.length
-        });
-        await applyLoadedRealtimeItems(videoKey, fallbackItems);
-        return;
-      }
-      console.warn('[yt-cc] page-context fallback still failed', {
-        videoKey,
-        status
-      });
-      const now = Date.now();
-      const lastRetryAt = Number(ytRtHtmlRetryAtByVideo.get(videoKey) || 0);
-      if (now - lastRetryAt > YT_RT_HTML_RETRY_COOLDOWN_MS) {
-        ytRtHtmlRetryAtByVideo.set(videoKey, now);
-        console.info('[yt-cc] scheduling one refresh retry after html response', {
-          videoKey
-        });
-        ytRtStatusText = '字幕源暂时异常，正在自动重试...';
-        ytRtNextLoadAt = now + 900;
-        renderRealtimeSubtitleList();
-        window.setTimeout(() => {
-          loadRealtimeTranscript(true);
-        }, 900);
-        return;
-      }
-    }
-
-    if (status === 'HTML_RESPONSE') {
-      if (isYouTubeAdPlaying()) {
-        ytRtItems = [];
-        ytRtStatusText = '广告阶段字幕不可用，广告结束后自动重试...';
-        ytRtTranscriptLoadedVideoKey = '';
-        ytRtNextLoadAt = Date.now() + YT_RT_AD_RETRY_MS;
-        renderRealtimeSubtitleList();
-        window.setTimeout(() => {
-          loadRealtimeTranscript(false);
-        }, YT_RT_AD_RETRY_MS + 120);
-        return;
-      }
-      const htmlReason = String(subtitleBundle?.debug?.htmlReason || '').trim();
-      console.warn('[yt-cc] subtitle response is html page', {
-        videoKey,
-        htmlReason,
-        debug: subtitleBundle?.debug || null
-      });
-      ytRtItems = [];
-      ytRtStatusText = htmlReason
-        ? `字幕加载失败：HTML 页面拦截（${htmlReason}）`
-        : '字幕加载失败：拿到的是 HTML 页面（同意页/登录页/验证码页），不是字幕数据';
-      ytRtTranscriptLoadedVideoKey = '';
-      ytRtNextLoadAt = Date.now() + 5000;
-      renderRealtimeSubtitleList();
-      return;
-    }
-    if (status === 'NO_SUBTITLES') {
-      console.warn('[yt-cc] no subtitles detected', {
-        videoKey,
-        track: summarizeBridgeTrackForLog(track),
-        fallbackFound: Boolean(fallbackUrl),
-        fallbackTimedtext: fallbackUrl ? getTimedtextUrlSummary(fallbackUrl) : null,
-        debug: subtitleBundle?.debug || null
-      });
-      ytRtItems = [];
-      ytRtStatusText = '未检测到字幕，请先开启 CC 或更换有字幕的视频';
-      ytRtTranscriptLoadedVideoKey = '';
-      ytRtNextLoadAt = Date.now() + 5000;
-      renderRealtimeSubtitleList();
-      return;
-    }
-
-    const items = mapSubtitleBundleToRealtimeItems(subtitleBundle, videoKey);
-    if (!items.length) {
-      ytRtItems = [];
-      ytRtStatusText = '该视频字幕为空';
-      ytRtTranscriptLoadedVideoKey = '';
-      ytRtNextLoadAt = Date.now() + 5000;
-      renderRealtimeSubtitleList();
-      return;
-    }
-
-    await applyLoadedRealtimeItems(videoKey, items);
-  } catch (err) {
-    const message = normalizeExtensionError(err);
-    console.warn('[yt-cc] subtitle pipeline failed', {
-      videoKey,
-      message
-    });
-    ytRtItems = [];
-    ytRtStatusText = `字幕加载失败：${message}`;
-    ytRtNextLoadAt = Date.now() + 5000;
+  if (isYouTubeCcEnabled() && ytRtFullTranscriptTriedVideoKey !== videoKey) {
+    ytRtFullTranscriptTriedVideoKey = videoKey;
+    ytRtStatusText = 'CC 已开启，正在加载全量字幕...';
     renderRealtimeSubtitleList();
-  } finally {
-    if (ytRtTranscriptLoadingVideoKey === videoKey) {
-      ytRtTranscriptLoadingVideoKey = '';
-    }
+    const fullLoaded = await tryLoadFullTranscriptOnce(videoKey);
+    if (fullLoaded) return;
   }
+
+  const subtitleText = getCurrentYoutubeSubtitleText();
+  if (!subtitleText) {
+    if (!ytRtItems.length) {
+      ytRtStatusText = '等待页面字幕流...（请先开启 CC）';
+      renderRealtimeSubtitleList();
+    }
+    return;
+  }
+  if (subtitleText === ytRtLastCaption) return;
+  ytRtLastCaption = subtitleText;
+  ytRtStatusText = '';
+  const currentTime = getCurrentVideoTimeSeconds();
+  queueRealtimeTranslation(subtitleText, currentTime);
 }
 
 function scheduleRealtimeSubtitleCapture() {
@@ -3134,6 +3108,13 @@ function getCurrentVideoTimeSeconds() {
   return Number.isFinite(currentTime) ? currentTime : -1;
 }
 
+function isYouTubeCcEnabled() {
+  const ccBtn = document.querySelector('.ytp-subtitles-button');
+  if (!ccBtn) return false;
+  const pressed = String(ccBtn.getAttribute('aria-pressed') || '').toLowerCase();
+  return pressed === 'true';
+}
+
 function ensureYouTubeCcEnabled() {
   const ccBtn = document.querySelector('.ytp-subtitles-button');
   if (ccBtn) {
@@ -3150,6 +3131,41 @@ function ensureYouTubeCcEnabled() {
       return true;
     }
   } catch (_) {}
+  return false;
+}
+
+async function tryLoadFullTranscriptOnce(videoKey) {
+  try {
+    const track = await requestCaptionTrackFromBridge(videoKey);
+    let fallbackUrl = '';
+    if (!track?.baseUrl) {
+      fallbackUrl = await findTimedtextUrlFromPerformanceWithRetry(videoKey);
+    }
+    if (!track?.baseUrl && !fallbackUrl) return false;
+
+    const pageContext = await buildPageContextPayload(videoKey, track, fallbackUrl);
+    const subtitleBundle = await requestSubtitleBundle(videoKey, track, fallbackUrl, pageContext);
+    const status = String(subtitleBundle?.status || '').toUpperCase();
+    if (status === 'OK') {
+      const items = mapSubtitleBundleToRealtimeItems(subtitleBundle, videoKey);
+      if (items.length) {
+        await applyLoadedRealtimeItems(videoKey, items);
+        return true;
+      }
+    }
+    if (status === 'HTML_RESPONSE' || status === 'NO_SUBTITLES') {
+      const fallbackItems = await tryLoadSubtitlesViaBridgeFallback(videoKey, track, fallbackUrl);
+      if (fallbackItems.length) {
+        await applyLoadedRealtimeItems(videoKey, fallbackItems);
+        return true;
+      }
+    }
+  } catch (err) {
+    console.warn('[yt-cc] full transcript load failed', {
+      videoKey,
+      message: normalizeExtensionError(err)
+    });
+  }
   return false;
 }
 
@@ -3233,8 +3249,6 @@ function ensureRealtimeSubtitleUi() {
         <span class="yt-rt-panel__title">实时翻译</span>
         <div class="yt-rt-panel__actions">
           <button type="button" class="yt-rt-btn yt-rt-btn--ghost" data-yt-rt-load-cc>加载CC</button>
-          <button type="button" class="yt-rt-btn yt-rt-btn--ghost" data-yt-rt-toggle>暂停</button>
-          <button type="button" class="yt-rt-btn yt-rt-btn--ghost" data-yt-rt-clear>清空</button>
           <button type="button" class="yt-rt-btn yt-rt-btn--ghost" data-yt-rt-hide>隐藏</button>
         </div>
       </div>
@@ -3243,8 +3257,6 @@ function ensureRealtimeSubtitleUi() {
     document.body.appendChild(panel);
 
     const loadCcBtn = panel.querySelector('[data-yt-rt-load-cc]');
-    const toggleBtn = panel.querySelector('[data-yt-rt-toggle]');
-    const clearBtn = panel.querySelector('[data-yt-rt-clear]');
     const hideBtn = panel.querySelector('[data-yt-rt-hide]');
     loadCcBtn?.addEventListener('click', async () => {
       if (loadCcBtn.disabled) return;
@@ -3262,21 +3274,6 @@ function ensureRealtimeSubtitleUi() {
         setButtonLoading(loadCcBtn, false);
       }
     });
-    toggleBtn?.addEventListener('click', () => {
-      ytRtEnabled = !ytRtEnabled;
-      toggleBtn.textContent = ytRtEnabled ? '暂停' : '继续';
-      if (ytRtEnabled) scheduleRealtimeSubtitleCapture();
-    });
-    clearBtn?.addEventListener('click', () => {
-      ytRtItems = [];
-      ytRtActiveItemId = '';
-      ytRtActiveIndex = -1;
-      ytRtTranscriptLoadedVideoKey = '';
-      ytRtStatusText = '已清空，重新加载中...';
-      renderRealtimeSubtitleList();
-      renderRealtimeSubtitleOverlay(null);
-      scheduleRealtimeSubtitleCapture();
-    });
     hideBtn?.addEventListener('click', () => {
       panel.classList.add('is-hidden');
       document
@@ -3289,6 +3286,8 @@ function ensureRealtimeSubtitleUi() {
         );
       const reopenBtn = document.getElementById(YT_RT_REOPEN_BTN_ID);
       if (reopenBtn) reopenBtn.classList.add('is-active');
+      renderRealtimeSubtitleOverlay(null);
+      syncNativeCaptionVisibility();
     });
   }
 
@@ -3304,6 +3303,7 @@ function ensureRealtimeSubtitleUi() {
       panel?.classList.remove('is-hidden');
       reopenBtn?.classList.remove('is-active');
       syncRealtimePanelLayout();
+      renderRealtimeSubtitleOverlay(ytRtItems[ytRtActiveIndex] || null);
     });
     document.body.appendChild(reopenBtn);
   }
@@ -3315,11 +3315,14 @@ function ensureRealtimeSubtitleUi() {
     overlay = document.createElement('div');
     overlay.id = YT_RT_OVERLAY_ID;
     overlay.innerHTML = `
+      <button type="button" class="yt-rt-overlay__drag-handle" data-yt-rt-overlay-drag title="拖动字幕位置">⋮⋮</button>
       <div class="yt-rt-overlay__source" data-yt-rt-source></div>
       <div class="yt-rt-overlay__translation" data-yt-rt-translation></div>
     `;
     document.body.appendChild(overlay);
+    enableRealtimeOverlayDrag(overlay);
   }
+  syncRealtimeOverlayLayout();
 }
 
 function pushRealtimeTranslationItem(source, translation, videoTimeSeconds = -1) {
@@ -3358,9 +3361,10 @@ function pushRealtimeTranslationItem(source, translation, videoTimeSeconds = -1)
 function renderRealtimeSubtitleOverlay(item) {
   const overlay = document.getElementById(YT_RT_OVERLAY_ID);
   if (!overlay) return;
+  const panel = document.getElementById(YT_RT_PANEL_ID);
   const sourceEl = overlay.querySelector('[data-yt-rt-source]');
   const translationEl = overlay.querySelector('[data-yt-rt-translation]');
-  if (!item) {
+  if (!item || !panel || panel.classList.contains('is-hidden')) {
     sourceEl.textContent = '';
     translationEl.textContent = '';
     overlay.classList.remove('is-active');

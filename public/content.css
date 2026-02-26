@@ -685,18 +685,39 @@ ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translat
 }
 
 #yt-rt-translate-overlay {
-  position: fixed;
+  position: absolute;
   left: 50%;
-  bottom: 58px;
-  transform: translateX(-50%);
-  z-index: 2147483645;
-  max-width: min(74vw, 1040px);
+  top: 84%;
+  transform: translate(-50%, -50%);
+  z-index: 40;
+  max-width: min(84%, 1040px);
   display: none;
   pointer-events: none;
 }
 
 #yt-rt-translate-overlay.is-active {
   display: block;
+}
+
+#yt-rt-translate-overlay .yt-rt-overlay__drag-handle {
+  position: absolute;
+  left: 50%;
+  top: -20px;
+  transform: translateX(-50%);
+  width: 44px;
+  height: 16px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.75);
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1;
+  cursor: grab;
+  pointer-events: auto;
+}
+
+#yt-rt-translate-overlay.is-dragging .yt-rt-overlay__drag-handle {
+  cursor: grabbing;
 }
 
 #yt-rt-translate-overlay .yt-rt-overlay__source,
@@ -712,6 +733,7 @@ ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translat
   line-height: 1.4;
   text-align: center;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
 }
 
 #yt-rt-translate-overlay .yt-rt-overlay__translation {
@@ -719,4 +741,13 @@ ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translat
   color: #e2e8f0;
   font-size: 17px;
   font-weight: 500;
+}
+
+ytd-watch-flexy.yt-rt-hide-native-captions .ytp-caption-window-container,
+ytd-watch-flexy.yt-rt-hide-native-captions .caption-window.ytp-caption-window-bottom,
+ytd-watch-flexy.yt-rt-hide-native-captions .ytp-caption-segment,
+ytd-watch-flexy.yt-rt-hide-native-captions .ytp-caption-window-rollup {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
 }
