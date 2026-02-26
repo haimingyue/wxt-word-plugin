@@ -396,3 +396,269 @@
   font-size: 12px;
   color: #0f172a;
 }
+
+:root {
+  --yt-rt-panel-width: 320px;
+}
+
+#yt-rt-translate-panel {
+  position: fixed;
+  top: 64px;
+  right: 8px;
+  bottom: 10px;
+  width: min(var(--yt-rt-panel-width), 32vw);
+  overflow: hidden;
+  z-index: 2147483645;
+  background: rgba(12, 17, 25, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 12px;
+  color: #f8fafc;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  box-shadow: 0 12px 30px rgba(2, 6, 23, 0.35);
+  display: flex;
+  flex-direction: column;
+}
+
+ytd-watch-flexy.yt-rt-vertical-view-active.yt-rt-target-full-bleed[full-bleed-player]:not([fullscreen])
+  #full-bleed-container {
+  width: calc(100% - var(--yt-rt-panel-width)) !important;
+  max-width: calc(100% - var(--yt-rt-panel-width)) !important;
+}
+
+ytd-watch-flexy.yt-rt-vertical-view-active.yt-rt-target-full-bleed
+  #full-bleed-container
+  #yt-rt-translate-panel {
+  position: absolute;
+  left: 100%;
+  top: 0;
+  right: auto;
+  bottom: auto;
+  width: var(--yt-rt-panel-width);
+  height: 100%;
+  max-height: none;
+  border-top: 0;
+  border-bottom: 0;
+  border-radius: 0 12px 12px 0;
+  z-index: 30;
+}
+
+ytd-watch-flexy.yt-rt-vertical-view-active.yt-rt-target-player-full-bleed
+  #player-full-bleed-container {
+  width: calc(100% - var(--yt-rt-panel-width)) !important;
+  max-width: calc(100% - var(--yt-rt-panel-width)) !important;
+}
+
+ytd-watch-flexy.yt-rt-vertical-view-active.yt-rt-target-player-full-bleed
+  #player-full-bleed-container
+  #yt-rt-translate-panel {
+  position: absolute;
+  left: 100%;
+  top: 0;
+  right: auto;
+  bottom: auto;
+  width: var(--yt-rt-panel-width);
+  height: 100%;
+  max-height: none;
+  border-top: 0;
+  border-bottom: 0;
+  border-radius: 0 12px 12px 0;
+  z-index: 30;
+}
+
+ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translate-reopen-btn {
+  display: none !important;
+}
+
+#yt-rt-translate-panel.is-hidden {
+  display: none;
+}
+
+#yt-rt-translate-panel .yt-rt-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+#yt-rt-translate-panel .yt-rt-panel__title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+#yt-rt-translate-panel .yt-rt-panel__actions {
+  display: flex;
+  gap: 6px;
+}
+
+#yt-rt-translate-panel .yt-rt-btn {
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(30, 41, 59, 0.9);
+  color: #f8fafc;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#yt-rt-translate-panel .yt-rt-btn:hover {
+  background: rgba(51, 65, 85, 0.95);
+}
+
+#yt-rt-translate-reopen-btn {
+  position: fixed;
+  right: 14px;
+  top: 72px;
+  z-index: 2147483646;
+  display: none;
+  border: 1px solid rgba(125, 211, 252, 0.45);
+  background: rgba(15, 23, 42, 0.95);
+  color: #e2e8f0;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 8px 18px rgba(2, 6, 23, 0.35);
+}
+
+#yt-rt-translate-reopen-btn.is-active {
+  display: block;
+}
+
+#yt-rt-translate-panel .yt-rt-panel__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  padding-bottom: 20px;
+  scroll-behavior: smooth;
+}
+
+@media (max-width: 1280px) {
+  :root {
+    --yt-rt-panel-width: 300px;
+  }
+  #yt-rt-translate-panel {
+    width: min(var(--yt-rt-panel-width), 38vw);
+  }
+}
+
+#yt-rt-translate-panel .yt-rt-empty {
+  padding: 12px;
+  color: #cbd5e1;
+  font-size: 13px;
+  line-height: 1.5;
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+#yt-rt-translate-panel .yt-rt-item {
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 4px 8px;
+}
+
+#yt-rt-translate-panel .yt-rt-item:hover {
+  border-color: rgba(56, 189, 248, 0.55);
+}
+
+#yt-rt-translate-panel .yt-rt-item.is-active {
+  border-color: #d946ef;
+  box-shadow: inset 0 0 0 1px rgba(217, 70, 239, 0.28);
+}
+
+#yt-rt-translate-panel .yt-rt-item__play {
+  grid-row: 1 / span 3;
+  align-self: start;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1px solid rgba(168, 85, 247, 0.45);
+  background: rgba(168, 85, 247, 0.18);
+  color: #f5d0fe;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+#yt-rt-translate-panel .yt-rt-item__play:hover {
+  background: rgba(168, 85, 247, 0.35);
+}
+
+#yt-rt-translate-panel .yt-rt-item__play-icon {
+  font-size: 10px;
+  line-height: 1;
+  margin-left: 1px;
+}
+
+#yt-rt-translate-panel .yt-rt-item__source {
+  font-size: 15px;
+  line-height: 1.45;
+  color: #f8fafc;
+}
+
+#yt-rt-translate-panel .yt-rt-source-word {
+  border-bottom: 1px dashed rgba(125, 211, 252, 0.55);
+  cursor: pointer;
+}
+
+#yt-rt-translate-panel .yt-rt-source-word:hover {
+  color: #7dd3fc;
+}
+
+#yt-rt-translate-panel .yt-rt-item__translation {
+  margin-top: 6px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #cbd5e1;
+}
+
+#yt-rt-translate-panel .yt-rt-item__translation.is-empty {
+  display: none;
+}
+
+#yt-rt-translate-overlay {
+  position: fixed;
+  left: 50%;
+  bottom: 58px;
+  transform: translateX(-50%);
+  z-index: 2147483645;
+  max-width: min(74vw, 1040px);
+  display: none;
+  pointer-events: none;
+}
+
+#yt-rt-translate-overlay.is-active {
+  display: block;
+}
+
+#yt-rt-translate-overlay .yt-rt-overlay__source,
+#yt-rt-translate-overlay .yt-rt-overlay__translation {
+  width: fit-content;
+  margin: 0 auto;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.84);
+  color: #f8fafc;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+#yt-rt-translate-overlay .yt-rt-overlay__translation {
+  margin-top: 8px;
+  color: #e2e8f0;
+  font-size: 17px;
+  font-weight: 500;
+}

@@ -48,6 +48,21 @@ const LEMMA_FILE_PATH = 'lemma.en.txt';
 const ECDICT_INDEX_DIR = 'ecdict-index';
 let lemmaIndexPromise = null;
 const ecdictIndexCache = new Map();
+const subtitleCache = new Map();
+const subtitleRequestAtByCacheKey = new Map();
+const SUBTITLE_CACHE_LIMIT = 60;
+const SUBTITLE_REQUEST_INTERVAL_MS = 1000;
+const SUBTITLE_RETRY_BACKOFF_MS = [400, 900, 1800];
+const SUBTITLE_HTML_RETRY_LIMIT = 2;
+const SUBTITLE_POSITIVE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const SUBTITLE_NEGATIVE_CACHE_TTL_MS = 60 * 1000;
+/**
+ * `yt-load-subtitles` payload (from content):
+ * {
+ *   videoId, track, fallbackUrl,
+ *   pageContext: { source, htmlReason, attempts[], candidates[], responses[], timings }
+ * }
+ */
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
@@ -211,6 +226,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     getAuthState(msg.payload?.refresh === true)
       .then((auth) => sendResponse({ success: true, auth }))
       .catch((err) => sendResponse({ success: false, message: err.message }));
+    return true;
+  }
+
+  if (msg?.type === 'deepseek-ready') {
+    canUseDeepseek()
+      .then((ready) => sendResponse({ success: true, ready }))
+      .catch((err) => sendResponse({ success: false, message: err.message }));
+    return true;
+  }
+
+  if (msg?.type === 'yt-fetch-text') {
+    fetchYoutubeText(msg.payload?.url || msg.url, sender)
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((err) => sendResponse({ success: false, message: err.message }));
+    return true;
+  }
+
+  if (msg?.type === 'yt-get-caption-tracks') {
+    fetchYoutubeCaptionTracks(msg.payload?.videoId || msg.videoId)
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((err) => sendResponse({ success: false, message: err.message }));
+    return true;
+  }
+
+  if (msg?.type === 'yt-load-subtitles') {
+    loadYoutubeSubtitles(msg.payload, sender)
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((err) =>
+        sendResponse({
+          success: false,
+          message: err?.message || '字幕加载失败',
+          code: err?.code || 'SUBTITLE_FAILED'
+        })
+      );
     return true;
   }
 
@@ -1029,6 +1078,1001 @@ async function deepseekDetectPhraseHandler(payload) {
     isPhrase: true,
     phrase: phraseInfo.phrase,
     meaning: phraseInfo.meaning || ''
+  };
+}
+
+async function canUseDeepseek() {
+  const auth = await getStoredAuthState();
+  if (String(auth?.token || '').trim()) return true;
+  const config = await getConfig();
+  return Boolean(String(config?.deepseekApiKey || '').trim());
+}
+
+function isAllowedYoutubeFetchUrl(url) {
+  const host = String(url?.hostname || '').toLowerCase();
+  return (
+    host === 'youtube.com' ||
+    host.endsWith('.youtube.com') ||
+    host === 'youtube-nocookie.com' ||
+    host.endsWith('.youtube-nocookie.com')
+  );
+}
+
+function normalizeYoutubeVideoId(rawVideoId) {
+  const videoId = String(rawVideoId || '').trim();
+  if (!videoId) return '';
+  if (!/^[A-Za-z0-9_-]{6,}$/.test(videoId)) return '';
+  return videoId;
+}
+
+function extractInnertubeValueFromHtml(html, key) {
+  const source = String(html || '');
+  if (!source) return '';
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`"${escapedKey}"\\s*:\\s*"([^"]+)"`);
+  const match = source.match(pattern);
+  if (!match?.[1]) return '';
+  return String(match[1])
+    .replace(/\\u0026/g, '&')
+    .replace(/\\"/g, '"')
+    .trim();
+}
+
+function extractYoutubeCaptionTracks(payload) {
+  const tracks = payload?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!Array.isArray(tracks)) return [];
+  return tracks
+    .map((track) => {
+      const baseUrl = String(track?.baseUrl || '').trim();
+      if (!baseUrl) return null;
+      return {
+        baseUrl,
+        languageCode: String(track?.languageCode || ''),
+        kind: String(track?.kind || ''),
+        vssId: String(track?.vssId || ''),
+        name: track?.name || null,
+        isTranslatable: Boolean(track?.isTranslatable)
+      };
+    })
+    .filter(Boolean);
+}
+
+async function fetchYoutubeCaptionTracks(rawVideoId) {
+  const videoId = normalizeYoutubeVideoId(rawVideoId);
+  if (!videoId) {
+    throw new Error('视频 ID 无效');
+  }
+
+  const watchUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en`;
+  const watchRes = await fetch(watchUrl, {
+    method: 'GET',
+    credentials: 'include',
+    headers: {
+      Accept: 'text/html,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8'
+    }
+  });
+  const watchHtml = await watchRes.text();
+  if (!watchRes.ok) {
+    throw new Error(`读取 watch 页面失败 (${watchRes.status})`);
+  }
+
+  const apiKey = extractInnertubeValueFromHtml(watchHtml, 'INNERTUBE_API_KEY');
+  if (!apiKey) {
+    throw new Error('watch 页面未提取到 INNERTUBE_API_KEY');
+  }
+  const clientVersion =
+    extractInnertubeValueFromHtml(watchHtml, 'INNERTUBE_CLIENT_VERSION') || '2.20260201.01.00';
+  const clientName =
+    extractInnertubeValueFromHtml(watchHtml, 'INNERTUBE_CLIENT_NAME') || 'WEB';
+
+  const endpoint =
+    `https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(apiKey)}` +
+    '&prettyPrint=false';
+  const playerRes = await fetch(endpoint, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json,text/plain,*/*',
+      'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8'
+    },
+    body: JSON.stringify({
+      videoId,
+      contentCheckOk: true,
+      racyCheckOk: true,
+      context: {
+        client: {
+          clientName,
+          clientVersion,
+          hl: 'en',
+          gl: 'US'
+        }
+      }
+    })
+  });
+
+  const playerRaw = await playerRes.text();
+  const normalizedRaw = String(playerRaw || '').replace(/^\)\]\}'\s*/, '');
+  let playerJson = null;
+  try {
+    playerJson = JSON.parse(normalizedRaw);
+  } catch (_) {
+    playerJson = null;
+  }
+  if (!playerRes.ok) {
+    throw new Error(`youtubei/player 请求失败 (${playerRes.status})`);
+  }
+  if (!playerJson || typeof playerJson !== 'object') {
+    throw new Error('youtubei/player 返回解析失败');
+  }
+
+  return {
+    source: 'youtubei',
+    videoId,
+    tracks: extractYoutubeCaptionTracks(playerJson)
+  };
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeSubtitleTrackPayload(rawTrack) {
+  if (!rawTrack || typeof rawTrack !== 'object') return null;
+  const baseUrl = String(rawTrack.baseUrl || '').trim();
+  if (!baseUrl) return null;
+  return {
+    videoId: normalizeYoutubeVideoId(rawTrack.videoId),
+    baseUrl,
+    languageCode: String(rawTrack.languageCode || '').trim(),
+    isAsr: Boolean(rawTrack.isAsr)
+  };
+}
+
+function parseTimedtextInfo(rawUrl) {
+  const info = {
+    videoId: '',
+    language: '',
+    isAutoGenerated: false,
+    tlang: '',
+    format: ''
+  };
+  const text = String(rawUrl || '').trim();
+  if (!text) return info;
+  try {
+    const url = new URL(text);
+    const videoId = normalizeYoutubeVideoId(url.searchParams.get('v'));
+    const language = String(url.searchParams.get('lang') || '').trim();
+    const tlang = String(url.searchParams.get('tlang') || '').trim();
+    const format = String(url.searchParams.get('fmt') || '').trim().toLowerCase();
+    const kind = String(url.searchParams.get('kind') || '').toLowerCase();
+    const caps = String(url.searchParams.get('caps') || '').toLowerCase();
+    info.videoId = videoId;
+    info.language = language;
+    info.isAutoGenerated = kind === 'asr' || caps === 'asr';
+    info.tlang = tlang;
+    info.format = format;
+    return info;
+  } catch (_) {
+    return info;
+  }
+}
+
+function summarizeTimedtextUrlForDebug(rawUrl) {
+  const summary = {
+    host: '',
+    path: '',
+    v: '',
+    lang: '',
+    tlang: '',
+    kind: '',
+    caps: '',
+    fmt: '',
+    hasExpire: false,
+    hasSignature: false,
+    hasPot: false
+  };
+  const text = String(rawUrl || '').trim();
+  if (!text) return summary;
+  try {
+    const url = new URL(text);
+    const pick = (name) => String(url.searchParams.get(name) || '').trim();
+    summary.host = String(url.host || '').trim();
+    summary.path = String(url.pathname || '').trim();
+    summary.v = normalizeYoutubeVideoId(pick('v'));
+    summary.lang = pick('lang');
+    summary.tlang = pick('tlang');
+    summary.kind = pick('kind');
+    summary.caps = pick('caps');
+    summary.fmt = pick('fmt');
+    summary.hasExpire = Boolean(pick('expire'));
+    summary.hasSignature = Boolean(pick('signature') || pick('sig') || pick('lsig'));
+    summary.hasPot = Boolean(pick('pot'));
+    return summary;
+  } catch (_) {
+    return summary;
+  }
+}
+
+function pushSubtitleDebugAttempt(debugLog, payload) {
+  if (!debugLog || !Array.isArray(debugLog.attempts)) return;
+  debugLog.attempts.push(payload);
+  if (debugLog.attempts.length > 80) {
+    debugLog.attempts.splice(0, debugLog.attempts.length - 80);
+  }
+}
+
+function buildSubtitleResult({
+  status = 'OK',
+  videoId = '',
+  language = '',
+  isAutoGenerated = false,
+  items = [],
+  message = '',
+  debug = null
+}) {
+  return {
+    status,
+    message,
+    videoKey: String(videoId || '').trim(),
+    videoId: String(videoId || '').trim(),
+    language: String(language || '').trim(),
+    isAutoGenerated: Boolean(isAutoGenerated),
+    itemCount: Array.isArray(items) ? items.length : 0,
+    items: Array.isArray(items) ? items : [],
+    debug: debug && typeof debug === 'object' ? debug : null
+  };
+}
+
+function buildSubtitleCacheKey({ videoId, languageCode, isAsr, tlang, format }) {
+  return [
+    `v=${String(videoId || '').trim()}`,
+    `lang=${String(languageCode || '').trim().toLowerCase()}`,
+    `asr=${Boolean(isAsr) ? 1 : 0}`,
+    `tlang=${String(tlang || '').trim().toLowerCase()}`,
+    `fmt=${String(format || 'auto').trim().toLowerCase()}`
+  ].join('|');
+}
+
+function getSubtitleCache(cacheKey) {
+  if (!cacheKey) return null;
+  const entry = subtitleCache.get(cacheKey);
+  if (!entry) return null;
+  if (Number(entry?.expiresAt || 0) <= Date.now()) {
+    subtitleCache.delete(cacheKey);
+    return null;
+  }
+  subtitleCache.delete(cacheKey);
+  subtitleCache.set(cacheKey, entry);
+  return entry;
+}
+
+function setSubtitleCache(cacheKey, value, options = {}) {
+  if (!cacheKey || !value) return;
+  const ttlMs = Math.max(1000, Number(options?.ttlMs || SUBTITLE_NEGATIVE_CACHE_TTL_MS));
+  const now = Date.now();
+  subtitleCache.delete(cacheKey);
+  subtitleCache.set(cacheKey, {
+    cacheKey,
+    createdAt: now,
+    expiresAt: now + ttlMs,
+    isNegative: options?.isNegative === true,
+    result: value
+  });
+  while (subtitleCache.size > SUBTITLE_CACHE_LIMIT) {
+    const firstKey = subtitleCache.keys().next().value;
+    if (!firstKey) break;
+    subtitleCache.delete(firstKey);
+  }
+}
+
+async function throttleSubtitleRequest(cacheKey) {
+  const now = Date.now();
+  const lastAt = Number(subtitleRequestAtByCacheKey.get(cacheKey) || 0);
+  const waitMs = SUBTITLE_REQUEST_INTERVAL_MS - (now - lastAt);
+  if (waitMs > 0) {
+    await delay(waitMs);
+  }
+  subtitleRequestAtByCacheKey.set(cacheKey, Date.now());
+  return waitMs > 0 ? waitMs : 0;
+}
+
+function decodeHtmlEntitiesLite(input) {
+  return String(input || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, num) => {
+      const code = Number(num);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : '';
+    });
+}
+
+function normalizeSubtitleText(input) {
+  return decodeHtmlEntitiesLite(input)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\u200b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseVttTimestampToSeconds(raw) {
+  const text = String(raw || '').trim().replace(',', '.');
+  if (!text) return NaN;
+  const parts = text.split(':');
+  if (parts.length < 2 || parts.length > 3) return NaN;
+  let hours = 0;
+  let minutes = 0;
+  let seconds = 0;
+  if (parts.length === 3) {
+    hours = Number(parts[0]);
+    minutes = Number(parts[1]);
+    seconds = Number(parts[2]);
+  } else {
+    minutes = Number(parts[0]);
+    seconds = Number(parts[1]);
+  }
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) {
+    return NaN;
+  }
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function parseVttToSubtitleItems(vttText, videoId) {
+  const source = String(vttText || '').replace(/\r/g, '').trim();
+  if (!source || !source.includes('-->')) return [];
+  const blocks = source.split(/\n{2,}/);
+  const items = [];
+  const seen = new Set();
+
+  blocks.forEach((block) => {
+    const lines = block
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!lines.length) return;
+    if (String(lines[0] || '').toUpperCase() === 'WEBVTT') return;
+
+    const timelineIndex = lines.findIndex((line) => line.includes('-->'));
+    if (timelineIndex < 0) return;
+
+    const timeline = lines[timelineIndex];
+    const [startRaw, endRawWithMeta] = timeline.split('-->');
+    const endRaw = String(endRawWithMeta || '').split(/\s+/)[0];
+    const startTime = parseVttTimestampToSeconds(startRaw);
+    const endTime = parseVttTimestampToSeconds(endRaw);
+    if (!Number.isFinite(startTime) || startTime < 0) return;
+    const resolvedEndTime =
+      Number.isFinite(endTime) && endTime > startTime ? endTime : startTime + 2.2;
+    const text = normalizeSubtitleText(lines.slice(timelineIndex + 1).join(' '));
+    if (!text) return;
+
+    const dedupeKey = `${Math.round(startTime * 10)}|${text}`;
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+
+    items.push({
+      id: `${videoId || 'yt'}-${items.length + 1}`,
+      text,
+      startTimeSeconds: Number(startTime.toFixed(3)),
+      endTimeSeconds: Number(resolvedEndTime.toFixed(3))
+    });
+  });
+
+  return items;
+}
+
+function parseJson3ToSubtitleItems(rawText, videoId) {
+  const normalized = String(rawText || '').replace(/^\)\]\}'\s*/, '');
+  if (!normalized) return [];
+  let payload = null;
+  try {
+    payload = JSON.parse(normalized);
+  } catch (_) {
+    payload = null;
+  }
+  const events = Array.isArray(payload?.events) ? payload.events : [];
+  if (!events.length) return [];
+
+  const items = [];
+  const seen = new Set();
+  events.forEach((event) => {
+    const segs = Array.isArray(event?.segs) ? event.segs : [];
+    if (!segs.length) return;
+    const text = normalizeSubtitleText(segs.map((seg) => seg?.utf8 || '').join(''));
+    if (!text) return;
+    const startMs = Number(event?.tStartMs);
+    const durationMs = Number(event?.dDurationMs);
+    if (!Number.isFinite(startMs) || startMs < 0) return;
+    const start = startMs / 1000;
+    const end =
+      Number.isFinite(durationMs) && durationMs > 0 ? start + durationMs / 1000 : start + 2.2;
+    const dedupeKey = `${Math.round(start * 10)}|${text}`;
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+    items.push({
+      id: `${videoId || 'yt'}-${items.length + 1}`,
+      text,
+      startTimeSeconds: Number(start.toFixed(3)),
+      endTimeSeconds: Number(end.toFixed(3))
+    });
+  });
+
+  return items;
+}
+
+function classifyHtmlSubtitleResponse(rawText) {
+  const text = String(rawText || '').toLowerCase();
+  if (!text) return 'UNKNOWN_HTML';
+  if (
+    text.includes('consent.youtube.com') ||
+    text.includes('before you continue') ||
+    text.includes('consent.google.com')
+  ) {
+    return 'CONSENT_REQUIRED';
+  }
+  if (text.includes('accounts.google.com') || text.includes('sign in')) {
+    return 'LOGIN_REQUIRED';
+  }
+  if (
+    text.includes('/sorry/') ||
+    text.includes('captcha') ||
+    text.includes('unusual traffic') ||
+    text.includes('recaptcha')
+  ) {
+    return 'CAPTCHA_DETECTED';
+  }
+  return 'UNKNOWN_HTML';
+}
+
+function htmlReasonToMessage(reason) {
+  if (reason === 'CONSENT_REQUIRED') return '需要先通过 YouTube 同意页';
+  if (reason === 'CAPTCHA_DETECTED') return '检测到验证码页面';
+  if (reason === 'LOGIN_REQUIRED') return '需要先登录 YouTube/Google 账号';
+  return '字幕请求返回了 HTML 页面';
+}
+
+function buildTimedtextFormatUrl(baseUrl, format) {
+  const url = new URL(baseUrl);
+  url.searchParams.set('fmt', format);
+  return url.toString();
+}
+
+function normalizeSubtitleStatus(status) {
+  const value = String(status || '').toUpperCase();
+  if (
+    value === 'OK' ||
+    value === 'NO_SUBTITLES' ||
+    value === 'HTML_RESPONSE' ||
+    value === 'NETWORK_ERROR' ||
+    value === 'PARSE_ERROR' ||
+    value === 'UNSUPPORTED'
+  ) {
+    return value;
+  }
+  return 'UNSUPPORTED';
+}
+
+function mergePageContextAttempts(debugLog, pageContext) {
+  const attempts = Array.isArray(pageContext?.attempts) ? pageContext.attempts : [];
+  attempts.forEach((attempt) => {
+    pushSubtitleDebugAttempt(debugLog, {
+      format: String(attempt?.format || ''),
+      attempt: Number(attempt?.attempt || 0),
+      status: Number(attempt?.status || 0),
+      contentType: String(attempt?.contentType || ''),
+      isHtml: Boolean(attempt?.isHtml),
+      reason: String(attempt?.reason || ''),
+      elapsedMs: Number(attempt?.elapsedMs || 0)
+    });
+  });
+}
+
+async function fetchSubtitleTextWithRetry(requestUrl, options = {}) {
+  const debugLog = options?.debugLog || null;
+  const format = String(options?.format || '').trim().toLowerCase();
+  const source = String(options?.source || 'BG_FETCH_FALLBACK').trim();
+  const htmlRetryLimit = Math.max(1, Number(options?.htmlRetryLimit || SUBTITLE_HTML_RETRY_LIMIT));
+  let lastFailure = {
+    code: 'NETWORK_ERROR',
+    message: '字幕请求失败'
+  };
+  let htmlAttempts = 0;
+
+  for (let attempt = 0; attempt < SUBTITLE_RETRY_BACKOFF_MS.length; attempt += 1) {
+    const attemptNumber = attempt + 1;
+    const startedAt = Date.now();
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+      }, 4500);
+      const response = await fetch(requestUrl, {
+        method: 'GET',
+        credentials: 'include',
+        signal: controller.signal,
+        headers: {
+          Accept: 'text/vtt,application/json,text/plain,*/*',
+          'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8'
+        }
+      });
+      clearTimeout(timeoutId);
+      const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+      const body = await response.text();
+      const isHtml =
+        contentType.includes('text/html') ||
+        contentType.includes('application/xhtml+xml') ||
+        /^\s*<!doctype html/i.test(body) ||
+        /^\s*<html/i.test(body);
+      const bodyHead = String(body || '')
+        .slice(0, 200)
+        .replace(/\s+/g, ' ')
+        .trim();
+      const elapsedMs = Date.now() - startedAt;
+      if (response.status !== 200) {
+        lastFailure = {
+          code: 'NETWORK_ERROR',
+          message: `字幕请求失败 (${response.status})`
+        };
+      } else if (isHtml) {
+        const htmlReason = classifyHtmlSubtitleResponse(body);
+        htmlAttempts += 1;
+        lastFailure = {
+          code: 'HTML_RESPONSE',
+          message: htmlReasonToMessage(htmlReason),
+          htmlReason
+        };
+        if (htmlAttempts >= htmlRetryLimit) {
+          pushSubtitleDebugAttempt(debugLog, {
+            source,
+            format,
+            attempt: attemptNumber,
+            status: response.status,
+            contentType,
+            isHtml: true,
+            reason: htmlReason,
+            elapsedMs,
+            htmlSnippet: bodyHead
+          });
+          return {
+            ok: false,
+            ...lastFailure
+          };
+        }
+      } else if (
+        !contentType.includes('text/vtt') &&
+        !contentType.includes('application/json') &&
+        !(contentType.includes('text/plain') && /^\s*webvtt/i.test(body))
+      ) {
+        lastFailure = {
+          code: 'PARSE_ERROR',
+          message: `字幕内容类型异常: ${contentType || 'unknown'}`
+        };
+      } else {
+        pushSubtitleDebugAttempt(debugLog, {
+          source,
+          format,
+          attempt: attemptNumber,
+          status: response.status,
+          contentType,
+          isHtml,
+          reason: '',
+          elapsedMs
+        });
+        return {
+          ok: true,
+          body,
+          contentType
+        };
+      }
+      pushSubtitleDebugAttempt(debugLog, {
+        source,
+        format,
+        attempt: attemptNumber,
+        status: response.status,
+        contentType,
+        isHtml,
+        reason: String(lastFailure?.htmlReason || ''),
+        elapsedMs,
+        htmlSnippet: isHtml ? bodyHead : ''
+      });
+    } catch (err) {
+      lastFailure = {
+        code: 'NETWORK_ERROR',
+        message: String(err?.message || err || '字幕网络请求失败')
+      };
+      pushSubtitleDebugAttempt(debugLog, {
+        source,
+        format,
+        attempt: attemptNumber,
+        status: 0,
+        contentType: '',
+        isHtml: false,
+        reason: 'NETWORK_ERROR',
+        elapsedMs: Date.now() - startedAt
+      });
+    }
+
+    if (attempt < SUBTITLE_RETRY_BACKOFF_MS.length - 1) {
+      await delay(SUBTITLE_RETRY_BACKOFF_MS[attempt] + Math.floor(Math.random() * 150));
+    }
+  }
+
+  return {
+    ok: false,
+    ...lastFailure
+  };
+}
+
+async function loadYoutubeSubtitles(payload, sender) {
+  const track = normalizeSubtitleTrackPayload(payload?.track);
+  const fallbackUrl = String(payload?.fallbackUrl || '').trim();
+  const fallbackInfo = parseTimedtextInfo(fallbackUrl);
+  const pageContext = payload?.pageContext && typeof payload.pageContext === 'object'
+    ? payload.pageContext
+    : null;
+
+  let videoId = normalizeYoutubeVideoId(payload?.videoId);
+  if (!videoId) {
+    videoId = track?.videoId || fallbackInfo.videoId;
+  }
+  if (!videoId) {
+    throw new Error('视频 ID 无效');
+  }
+
+  const languageCode = String(track?.languageCode || fallbackInfo.language || '').trim();
+  const isAsr = Boolean(track?.isAsr || fallbackInfo.isAutoGenerated);
+  const tlang = String(fallbackInfo.tlang || '').trim();
+  const pageFormatHint = String(
+    Array.isArray(pageContext?.responses) && pageContext.responses[0]?.format
+      ? pageContext.responses[0].format
+      : ''
+  )
+    .trim()
+    .toLowerCase();
+  const formatHint = String(pageFormatHint || fallbackInfo.format || payload?.format || 'auto')
+    .trim()
+    .toLowerCase();
+  const cacheKey = buildSubtitleCacheKey({
+    videoId,
+    languageCode,
+    isAsr,
+    tlang,
+    format: formatHint || 'auto'
+  });
+  const startedAt = Date.now();
+
+  const debugLog = {
+    requestAt: new Date().toISOString(),
+    videoId,
+    source: 'INJECTED_FETCH',
+    htmlReason: '',
+    cacheKey,
+    cacheHit: false,
+    cacheAgeMs: 0,
+    throttleWaitMs: 0,
+    timings: {
+      totalMs: 0,
+      pageFetchMs: Number(pageContext?.timings?.pageFetchMs || 0),
+      bgFallbackMs: 0
+    },
+    track: track
+      ? {
+          languageCode: track.languageCode,
+          isAsr: Boolean(track.isAsr),
+          timedtext: summarizeTimedtextUrlForDebug(track.baseUrl)
+        }
+      : null,
+    fallback: fallbackUrl
+      ? {
+          videoId: fallbackInfo.videoId,
+          language: fallbackInfo.language,
+          isAutoGenerated: Boolean(fallbackInfo.isAutoGenerated),
+          timedtext: summarizeTimedtextUrlForDebug(fallbackUrl)
+        }
+      : null,
+    candidates: [],
+    attempts: [],
+    finalReason: ''
+  };
+  const cached = getSubtitleCache(cacheKey);
+  if (cached?.result) {
+    debugLog.timings.totalMs = Date.now() - startedAt;
+    return {
+      ...cached.result,
+      debug: {
+        ...(cached?.result?.debug && typeof cached.result.debug === 'object'
+          ? cached.result.debug
+          : {}),
+        videoId,
+        cacheKey,
+        cacheHit: true,
+        cacheAgeMs: Math.max(0, Date.now() - Number(cached.createdAt || Date.now())),
+        timings: {
+          ...(cached?.result?.debug?.timings || {}),
+          totalMs: debugLog.timings.totalMs
+        },
+        returnedAt: new Date().toISOString()
+      }
+    };
+  }
+
+  debugLog.throttleWaitMs = await throttleSubtitleRequest(cacheKey);
+  mergePageContextAttempts(debugLog, pageContext);
+  if (pageContext?.htmlReason) {
+    debugLog.htmlReason = String(pageContext.htmlReason);
+  }
+
+  const candidates = [];
+  if (track?.baseUrl) {
+    candidates.push({
+      baseUrl: track.baseUrl,
+      language: track.languageCode,
+      isAutoGenerated: track.isAsr
+    });
+  }
+  if (fallbackUrl) {
+    candidates.push({
+      baseUrl: fallbackUrl,
+      language: fallbackInfo.language,
+      isAutoGenerated: fallbackInfo.isAutoGenerated
+    });
+  }
+
+  const uniqueCandidates = [];
+  const seen = new Set();
+  candidates.forEach((candidate) => {
+    const key = String(candidate?.baseUrl || '').trim();
+    if (!key || seen.has(key)) return;
+    try {
+      const parsed = new URL(key);
+      if (!isAllowedYoutubeFetchUrl(parsed)) return;
+    } catch (_) {
+      return;
+    }
+    seen.add(key);
+    uniqueCandidates.push(candidate);
+  });
+
+  debugLog.candidates = uniqueCandidates.map((candidate, index) => ({
+    index,
+    language: String(candidate.language || '').trim(),
+    isAutoGenerated: Boolean(candidate.isAutoGenerated),
+    timedtext: summarizeTimedtextUrlForDebug(candidate.baseUrl)
+  }));
+
+  if (!uniqueCandidates.length) {
+    debugLog.finalReason = 'NO_VALID_CANDIDATE';
+    const result = buildSubtitleResult({
+      status: 'UNSUPPORTED',
+      videoId,
+      language: '',
+      isAutoGenerated: false,
+      items: [],
+      message: '未提供有效字幕轨道',
+      debug: debugLog
+    });
+    setSubtitleCache(cacheKey, result, {
+      ttlMs: SUBTITLE_NEGATIVE_CACHE_TTL_MS,
+      isNegative: true
+    });
+    return result;
+  }
+
+  const pageResponses = Array.isArray(pageContext?.responses) ? pageContext.responses : [];
+  let parseFailureDetected = false;
+  for (const response of pageResponses) {
+    const format = String(response?.format || '').toLowerCase();
+    const body = String(response?.body || '');
+    if (!body) continue;
+    const resolvedLanguage = String(response?.languageCode || languageCode || '').trim();
+    const resolvedAsr = Boolean(response?.isAsr ?? isAsr);
+    const parsedItems =
+      format === 'json3'
+        ? parseJson3ToSubtitleItems(body, videoId)
+        : parseVttToSubtitleItems(body, videoId);
+    if (parsedItems.length > 0) {
+      debugLog.source = String(response?.source || 'INJECTED_FETCH').toUpperCase();
+      debugLog.finalReason = `${format.toUpperCase()}_OK_FROM_PAGE`;
+      debugLog.timings.totalMs = Date.now() - startedAt;
+      const result = buildSubtitleResult({
+        status: 'OK',
+        videoId,
+        language: resolvedLanguage,
+        isAutoGenerated: resolvedAsr,
+        items: parsedItems,
+        debug: debugLog
+      });
+      setSubtitleCache(cacheKey, result, {
+        ttlMs: SUBTITLE_POSITIVE_CACHE_TTL_MS,
+        isNegative: false
+      });
+      return result;
+    }
+    parseFailureDetected = true;
+  }
+
+  const htmlAttempt = [...debugLog.attempts].reverse().find((attempt) => attempt?.isHtml);
+  if (htmlAttempt) {
+    const htmlReason = String(htmlAttempt?.reason || debugLog.htmlReason || 'UNKNOWN_HTML');
+    debugLog.htmlReason = htmlReason;
+    debugLog.finalReason = 'HTML_RESPONSE_FROM_PAGE';
+    debugLog.timings.totalMs = Date.now() - startedAt;
+    const htmlResult = buildSubtitleResult({
+      status: 'HTML_RESPONSE',
+      videoId,
+      language: languageCode,
+      isAutoGenerated: isAsr,
+      items: [],
+      message: htmlReasonToMessage(htmlReason),
+      debug: debugLog
+    });
+    setSubtitleCache(cacheKey, htmlResult, {
+      ttlMs: SUBTITLE_NEGATIVE_CACHE_TTL_MS,
+      isNegative: true
+    });
+    return htmlResult;
+  }
+
+  const bgFallbackStart = Date.now();
+  for (const candidate of uniqueCandidates) {
+    const vttResult = await fetchSubtitleTextWithRetry(buildTimedtextFormatUrl(candidate.baseUrl, 'vtt'), {
+      debugLog,
+      format: 'vtt',
+      source: 'BG_FETCH_FALLBACK'
+    });
+    if (vttResult.ok) {
+      const parsed = parseVttToSubtitleItems(vttResult.body, videoId);
+      if (parsed.length > 0) {
+        debugLog.source = 'BG_FETCH_FALLBACK';
+        debugLog.finalReason = 'VTT_OK_BG_FALLBACK';
+        debugLog.timings.bgFallbackMs = Date.now() - bgFallbackStart;
+        debugLog.timings.totalMs = Date.now() - startedAt;
+        debugLog.risk =
+          'fallback path used background fetch; may still hit YouTube consent/login/captcha HTML';
+        const result = buildSubtitleResult({
+          status: 'OK',
+          videoId,
+          language: String(candidate.language || languageCode || '').trim(),
+          isAutoGenerated: Boolean(candidate.isAutoGenerated),
+          items: parsed,
+          debug: debugLog
+        });
+        setSubtitleCache(cacheKey, result, {
+          ttlMs: SUBTITLE_POSITIVE_CACHE_TTL_MS,
+          isNegative: false
+        });
+        return result;
+      }
+      parseFailureDetected = true;
+    }
+
+    const jsonResult = await fetchSubtitleTextWithRetry(
+      buildTimedtextFormatUrl(candidate.baseUrl, 'json3'),
+      {
+        debugLog,
+        format: 'json3',
+        source: 'BG_FETCH_FALLBACK'
+      }
+    );
+    if (jsonResult.ok) {
+      const parsed = parseJson3ToSubtitleItems(jsonResult.body, videoId);
+      if (parsed.length > 0) {
+        debugLog.source = 'BG_FETCH_FALLBACK';
+        debugLog.finalReason = 'JSON3_OK_BG_FALLBACK';
+        debugLog.timings.bgFallbackMs = Date.now() - bgFallbackStart;
+        debugLog.timings.totalMs = Date.now() - startedAt;
+        debugLog.risk =
+          'fallback path used background fetch; may still hit YouTube consent/login/captcha HTML';
+        const result = buildSubtitleResult({
+          status: 'OK',
+          videoId,
+          language: String(candidate.language || languageCode || '').trim(),
+          isAutoGenerated: Boolean(candidate.isAutoGenerated),
+          items: parsed,
+          debug: debugLog
+        });
+        setSubtitleCache(cacheKey, result, {
+          ttlMs: SUBTITLE_POSITIVE_CACHE_TTL_MS,
+          isNegative: false
+        });
+        return result;
+      }
+      parseFailureDetected = true;
+    }
+  }
+
+  const latestHtml = [...debugLog.attempts].reverse().find((attempt) => attempt?.isHtml);
+  if (latestHtml) {
+    const htmlReason = String(latestHtml?.reason || debugLog.htmlReason || 'UNKNOWN_HTML');
+    debugLog.htmlReason = htmlReason;
+    debugLog.source = debugLog.source || 'INJECTED_FETCH';
+    debugLog.finalReason = 'HTML_RESPONSE';
+    debugLog.timings.bgFallbackMs = Date.now() - bgFallbackStart;
+    debugLog.timings.totalMs = Date.now() - startedAt;
+    const result = buildSubtitleResult({
+      status: 'HTML_RESPONSE',
+      videoId,
+      language: languageCode,
+      isAutoGenerated: isAsr,
+      items: [],
+      message: htmlReasonToMessage(htmlReason),
+      debug: debugLog
+    });
+    setSubtitleCache(cacheKey, result, {
+      ttlMs: SUBTITLE_NEGATIVE_CACHE_TTL_MS,
+      isNegative: true
+    });
+    return result;
+  }
+
+  const hasNetworkFailure = debugLog.attempts.some((attempt) =>
+    String(attempt?.reason || '').toUpperCase() === 'NETWORK_ERROR'
+  );
+  const status = hasNetworkFailure
+    ? 'NETWORK_ERROR'
+    : parseFailureDetected
+      ? 'PARSE_ERROR'
+      : normalizeSubtitleStatus('NO_SUBTITLES');
+  debugLog.finalReason = hasNetworkFailure
+    ? 'NETWORK_ERROR'
+    : parseFailureDetected
+      ? 'PARSE_ERROR'
+      : 'NO_ITEMS_PARSED';
+  debugLog.timings.bgFallbackMs = Date.now() - bgFallbackStart;
+  debugLog.timings.totalMs = Date.now() - startedAt;
+  const finalResult = buildSubtitleResult({
+    status,
+    videoId,
+    language: languageCode,
+    isAutoGenerated: isAsr,
+    items: [],
+    message:
+      status === 'NETWORK_ERROR'
+        ? '字幕请求失败（网络或超时）'
+        : status === 'PARSE_ERROR'
+          ? '字幕解析失败'
+          : '未解析到字幕内容',
+    debug: debugLog
+  });
+  setSubtitleCache(cacheKey, finalResult, {
+    ttlMs: SUBTITLE_NEGATIVE_CACHE_TTL_MS,
+    isNegative: true
+  });
+  return finalResult;
+}
+
+async function fetchYoutubeText(rawUrl, sender) {
+  const urlText = String(rawUrl || '').trim();
+  if (!urlText) throw new Error('缺少请求地址');
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(urlText);
+  } catch (_) {
+    throw new Error('请求地址格式错误');
+  }
+  if (!isAllowedYoutubeFetchUrl(parsedUrl)) {
+    throw new Error('仅允许请求 YouTube 字幕地址');
+  }
+
+  const res = await fetch(parsedUrl.toString(), {
+    method: 'GET',
+    credentials: 'include',
+    headers: {
+      Accept: '*/*',
+      'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8'
+    }
+  });
+
+  return {
+    source: 'background',
+    ok: res.ok,
+    status: res.status,
+    contentType: res.headers.get('content-type') || '',
+    text: await res.text()
   };
 }
 

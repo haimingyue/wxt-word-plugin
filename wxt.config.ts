@@ -11,7 +11,11 @@ export default defineConfig({
     host_permissions: [
       'http://127.0.0.1/*',
       'https://api.deepseek.com/*',
-      'http://47.120.34.161/*'
+      'http://47.120.34.161/*',
+      'https://youtube.com/*',
+      'https://*.youtube.com/*',
+      'https://youtube-nocookie.com/*',
+      'https://*.youtube-nocookie.com/*'
     ],
     action: {
       default_title: 'Anki Example Collector',
@@ -48,6 +52,15 @@ export default defineConfig({
       {
         resources: ['assets/audio-waves.png'],
         matches: ['<all_urls>']
+      },
+      {
+        resources: ['injected.js'],
+        matches: [
+          'https://youtube.com/*',
+          'https://*.youtube.com/*',
+          'https://youtube-nocookie.com/*',
+          'https://*.youtube-nocookie.com/*'
+        ]
       }
     ],
     content_scripts: [
