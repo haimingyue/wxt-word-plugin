@@ -739,6 +739,19 @@ ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translat
   pointer-events: none;
 }
 
+#yt-rt-translate-overlay .yt-rt-overlay__source {
+  pointer-events: auto;
+}
+
+#yt-rt-translate-overlay .yt-rt-source-word {
+  border-bottom: 1px dashed rgba(125, 211, 252, 0.7);
+  cursor: pointer;
+}
+
+#yt-rt-translate-overlay .yt-rt-source-word:hover {
+  color: #7dd3fc;
+}
+
 #yt-rt-translate-overlay .yt-rt-overlay__translation {
   margin-top: 8px;
   color: #e2e8f0;

@@ -369,7 +369,7 @@ function startSentenceParse(prefilledSelection) {
   );
 }
 
-async function startEcdictLookup(prefilledSelection, anchorRect = null) {
+async function startEcdictLookup(prefilledSelection, anchorRect = null, options = {}) {
   const selected = (prefilledSelection || getSelectionText()).trim();
   if (!selected || /\s/.test(selected)) {
     showToast('请先选中一个单词');
@@ -404,7 +404,8 @@ async function startEcdictLookup(prefilledSelection, anchorRect = null) {
       hideTtsSentence: true,
       title: 'DeepSeek 释义',
       meaningPlaceholder: '正在查询 DeepSeek...',
-      showDictionaryResult: true
+      showDictionaryResult: true,
+      preferLeft: Boolean(options?.preferLeft)
     }
   );
 }
@@ -906,7 +907,7 @@ function openMeaningPanel(data, rect, options = {}) {
   }
 
   document.body.appendChild(panel);
-  positionMeaningPanel(panel, rect);
+  positionMeaningPanel(panel, rect, options);
   if (skipMeaning) {
     const meaningEl = panel.querySelector('[data-meaning]');
     if (meaningEl) {
@@ -1092,7 +1093,7 @@ function getSelectionRect(selection) {
   return null;
 }
 
-function positionMeaningPanel(panel, rect) {
+function positionMeaningPanel(panel, rect, options = {}) {
   const margin = 8;
   if (!rect) {
     panel.style.top = `${margin}px`;
@@ -1100,10 +1101,14 @@ function positionMeaningPanel(panel, rect) {
     return;
   }
 
+  const preferLeft = Boolean(options?.preferLeft);
   const panelRect = panel.getBoundingClientRect();
   let left = rect.left;
   let top = rect.bottom + margin;
 
+  if (preferLeft) {
+    left = rect.left - panelRect.width - margin;
+  }
   if (left + panelRect.width > window.innerWidth - margin) {
     left = window.innerWidth - panelRect.width - margin;
   }
@@ -3860,6 +3865,19 @@ function ensureRealtimeSubtitleUi() {
     `;
     document.body.appendChild(overlay);
     enableRealtimeOverlayDrag(overlay);
+    const overlaySource = overlay.querySelector('[data-yt-rt-source]');
+    overlaySource?.addEventListener('click', (event) => {
+      const target = event.target;
+      const word = target?.dataset?.ytWord || '';
+      if (!word) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const video = getCurrentVideoElement();
+      if (video && !video.paused) video.pause();
+      const anchorRect =
+        target instanceof HTMLElement ? target.getBoundingClientRect() : null;
+      startEcdictLookup(word, anchorRect);
+    });
   }
   syncRealtimeOverlayLayout();
 }
@@ -3961,7 +3979,7 @@ function renderRealtimeSubtitleOverlay(item) {
     return;
   }
 
-  sourceEl.textContent = source;
+  sourceEl.innerHTML = buildRealtimeSourceHtml(source);
   translationEl.textContent = translation;
   translationEl.style.display = ytRtCanTranslate === false || !translation ? 'none' : 'block';
   overlay.classList.add('is-active');
@@ -4011,7 +4029,7 @@ function renderRealtimeSubtitleList() {
       if (video && !video.paused) video.pause();
       const anchorRect =
         target instanceof HTMLElement ? target.getBoundingClientRect() : null;
-      startEcdictLookup(word, anchorRect);
+      startEcdictLookup(word, anchorRect, { preferLeft: true });
     });
 
     row.addEventListener('click', (event) => {
