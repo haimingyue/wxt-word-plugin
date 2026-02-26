@@ -32,6 +32,14 @@ const YT_RT_FAST_PREFETCH_AHEAD = 1;
 const YT_RT_FAST_TIMEOUT_MS = 4200;
 const YT_RT_ACTIVE_PREFETCH_AHEAD = 1;
 const YT_RT_PLAYBACK_SYNC_MS = 120;
+const YT_RT_TRANSLATE_WINDOW_AHEAD = 10;
+const YT_RT_TRANSLATE_WINDOW_BEHIND = 0;
+const YT_RT_SEEK_WINDOW_AHEAD = 6;
+const YT_RT_SEEK_WINDOW_BEHIND = 2;
+const YT_RT_SEEK_JUMP_SECONDS = 2;
+const YT_RT_BUDGET_TOTAL = 300;
+const YT_RT_BUDGET_SEEK_RESERVE = 80;
+const YT_RT_FULL_TRANSCRIPT_RETRY_MS = 5000;
 const YT_RT_BACKFILL_STEP_BATCH = 4;
 const YT_RT_BACKFILL_BATCH_TRANSLATE_SIZE = 100;
 const YT_RT_BACKFILL_BATCH_RPC_SIZE = 20;
@@ -80,11 +88,13 @@ let ytRtAutoCcTriedVideoKey = '';
 let ytRtLoadingPromise = null;
 let ytRtNextLoadAt = 0;
 let ytRtAdDetectionStartedAt = 0;
+let ytRtLastPlaybackSeconds = -1;
 const ytRtPlayerResponseCache = new Map();
 const ytRtTranslationCache = new Map();
 const ytRtCaptionTrackCache = new Map();
 const ytRtTranslationInflight = new Map();
 const ytRtBackfillFailedAt = new Map();
+const ytRtBudgetSourcesByVideo = new Map();
 const ytCaptionTrackWaiters = [];
 const ytCaptionBridgeFetchWaiters = new Map();
 let ytCaptionBridgeInitialized = false;
@@ -94,6 +104,7 @@ let ytCaptionLastTrack = null;
 let ytCaptionBridgeFetchSeq = 0;
 const ytRtHtmlRetryAtByVideo = new Map();
 const ytRtSubtitleBlockedUntilByVideo = new Map();
+const ytRtNextFullTranscriptTryAtByVideo = new Map();
 let ytRtOverlayPos = null;
 let ytRtOverlayDragBound = false;
 let ytRtOverlayPendingItemId = '';
@@ -1641,8 +1652,10 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtAutoCcTriedVideoKey = '';
     ytRtLoadingPromise = null;
     ytRtNextLoadAt = 0;
+    ytRtLastPlaybackSeconds = -1;
     ytRtHtmlRetryAtByVideo.clear();
     ytRtSubtitleBlockedUntilByVideo.clear();
+    ytRtNextFullTranscriptTryAtByVideo.clear();
     ytRtPlayerResponseCache.clear();
     ytRtCaptionTrackCache.clear();
     ytRtFastLaneInFlight = false;
@@ -1656,6 +1669,7 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtOverlayPendingItemId = '';
     ytRtTranslationInflight.clear();
     ytRtBackfillFailedAt.clear();
+    ytRtBudgetSourcesByVideo.clear();
     renderRealtimeSubtitleList();
     renderRealtimeSubtitleOverlay(null);
   }
@@ -1734,6 +1748,7 @@ function teardownRealtimeSubtitleObserver() {
   ytRtPlaybackTimer = 0;
   ytRtLoadingPromise = null;
   ytRtNextLoadAt = 0;
+  ytRtLastPlaybackSeconds = -1;
   ytRtFastLaneInFlight = false;
   ytRtFastLaneVideoKey = '';
   ytRtFastLaneTargets = [];
@@ -1741,6 +1756,8 @@ function teardownRealtimeSubtitleObserver() {
   ytRtBackfillCursor = 0;
   ytRtTranslationInflight.clear();
   ytRtBackfillFailedAt.clear();
+  ytRtBudgetSourcesByVideo.clear();
+  ytRtNextFullTranscriptTryAtByVideo.clear();
   document
     .querySelector('ytd-watch-flexy')
     ?.classList?.remove(
@@ -2524,6 +2541,7 @@ async function applyLoadedRealtimeItems(videoKey, items) {
   ytRtTranscriptLoadedVideoKey = videoKey;
   ytRtActiveItemId = '';
   ytRtActiveIndex = -1;
+  ytRtLastPlaybackSeconds = -1;
   renderRealtimeSubtitleList();
   syncRealtimeActiveItemByPlayback(true);
 
@@ -3021,16 +3039,25 @@ function syncRealtimeActiveItemByPlayback(shouldScroll = true) {
   if (!ytRtItems.length) return;
   const seconds = getCurrentVideoTimeSeconds();
   if (!Number.isFinite(seconds) || seconds < 0) return;
+  const prevSeconds = ytRtLastPlaybackSeconds;
+  ytRtLastPlaybackSeconds = seconds;
+  const isSeekJump =
+    Number.isFinite(prevSeconds) && Math.abs(seconds - prevSeconds) > YT_RT_SEEK_JUMP_SECONDS;
   const index = findRealtimeItemIndexByTime(seconds);
   if (index < 0 || index >= ytRtItems.length) return;
-  if (index === ytRtActiveIndex && ytRtItems[index]?.id === ytRtActiveItemId) return;
+  if (index === ytRtActiveIndex && ytRtItems[index]?.id === ytRtActiveItemId) {
+    if (isSeekJump) {
+      triggerActiveSentenceTranslation(ytRtTranscriptLoadedVideoKey, index, { isSeek: true });
+    }
+    return;
+  }
 
   ytRtActiveIndex = index;
   ytRtActiveItemId = ytRtItems[index]?.id || '';
   ytRtOverlayPendingItemId = ytRtActiveItemId;
   renderRealtimeSubtitleOverlay(ytRtItems[index] || null);
   updateRealtimeActiveRow(shouldScroll);
-  triggerActiveSentenceTranslation(ytRtTranscriptLoadedVideoKey, index);
+  triggerActiveSentenceTranslation(ytRtTranscriptLoadedVideoKey, index, { isSeek: isSeekJump });
 }
 
 function findRealtimeItemIndexByTime(seconds) {
@@ -3060,87 +3087,45 @@ function setRealtimeActiveById(itemId, shouldScroll = true) {
   ytRtOverlayPendingItemId = ytRtActiveItemId;
   renderRealtimeSubtitleOverlay(ytRtItems[index] || null);
   updateRealtimeActiveRow(shouldScroll);
-  triggerActiveSentenceTranslation(ytRtTranscriptLoadedVideoKey, index);
+  triggerActiveSentenceTranslation(ytRtTranscriptLoadedVideoKey, index, { isSeek: true });
 }
 
-function triggerActiveSentenceTranslation(videoKey, index) {
+function triggerActiveSentenceTranslation(videoKey, index, { isSeek = false } = {}) {
   if (!ytRtEnabled) return;
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!Number.isInteger(index) || index < 0 || index >= ytRtItems.length) return;
-  const item = ytRtItems[index];
-  if (!item) return;
+  translateTimelineItemByIndex(videoKey, index, {
+    timeoutMs: YT_RT_FAST_TIMEOUT_MS,
+    markBackfillFailure: false,
+    budgetMode: 'seek'
+  }).catch(() => {});
 
-  const source = String(item.source || '').trim();
-  if (!source) return;
-  const cached = ytRtTranslationCache.get(source);
-  if (cached) {
-    item.translation = cached;
-    if (item.id === ytRtActiveItemId) renderRealtimeSubtitleOverlay(item);
-    return;
-  }
-
-  let inflight = ytRtTranslationInflight.get(source);
-  if (!inflight) {
-    inflight = requestRealtimeSentenceTranslationWithTimeout(source, YT_RT_FAST_TIMEOUT_MS)
-      .then((translated) => {
-        const text = String(translated || '').trim();
-        if (text) {
-          ytRtTranslationCache.set(source, text);
-          if (ytRtTranslationCache.size > 1200) {
-            const firstKey = ytRtTranslationCache.keys().next().value;
-            if (firstKey) ytRtTranslationCache.delete(firstKey);
-          }
-        }
-        return text;
-      })
-      .finally(() => {
-        ytRtTranslationInflight.delete(source);
-      });
-    ytRtTranslationInflight.set(source, inflight);
-  }
-
-  inflight.then((translated) => {
-    if (!translated) return;
-    if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
-    const target = ytRtItems[index];
-    if (!target || target.id !== item.id) return;
-    target.translation = translated;
-    if (target.id === ytRtActiveItemId) renderRealtimeSubtitleOverlay(target);
+  const ahead = isSeek ? YT_RT_SEEK_WINDOW_AHEAD : YT_RT_TRANSLATE_WINDOW_AHEAD;
+  const behind = isSeek ? YT_RT_SEEK_WINDOW_BEHIND : YT_RT_TRANSLATE_WINDOW_BEHIND;
+  prefetchUpcomingRealtimeTranslations(videoKey, index, {
+    ahead,
+    behind,
+    budgetMode: isSeek ? 'seek' : 'normal'
   });
-
-  prefetchUpcomingRealtimeTranslations(videoKey, index);
 }
 
-function prefetchUpcomingRealtimeTranslations(videoKey, centerIndex) {
+function prefetchUpcomingRealtimeTranslations(
+  videoKey,
+  centerIndex,
+  { ahead = YT_RT_ACTIVE_PREFETCH_AHEAD, behind = 0, budgetMode = 'normal' } = {}
+) {
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return;
 
-  for (let i = 1; i <= YT_RT_ACTIVE_PREFETCH_AHEAD; i += 1) {
-    const idx = centerIndex + i;
-    if (idx < 0 || idx >= ytRtItems.length) break;
-    const item = ytRtItems[idx];
-    if (!item || item.translation) continue;
-    const source = String(item.source || '').trim();
-    if (!source) continue;
-    if (ytRtTranslationCache.has(source) || ytRtTranslationInflight.has(source)) continue;
-
-    const inflight = requestRealtimeSentenceTranslationWithTimeout(source, YT_RT_FAST_TIMEOUT_MS)
-      .then((translated) => {
-        const text = String(translated || '').trim();
-        if (!text) return '';
-        ytRtTranslationCache.set(source, text);
-        if (ytRtTranslationCache.size > 1200) {
-          const firstKey = ytRtTranslationCache.keys().next().value;
-          if (firstKey) ytRtTranslationCache.delete(firstKey);
-        }
-        if (!item.translation) item.translation = text;
-        return text;
-      })
-      .finally(() => {
-        ytRtTranslationInflight.delete(source);
-      });
-
-    ytRtTranslationInflight.set(source, inflight);
+  const min = Math.max(0, centerIndex - Math.max(0, Number(behind) || 0));
+  const max = Math.min(ytRtItems.length - 1, centerIndex + Math.max(0, Number(ahead) || 0));
+  for (let idx = min; idx <= max; idx += 1) {
+    if (idx === centerIndex) continue;
+    translateTimelineItemByIndex(videoKey, idx, {
+      timeoutMs: YT_RT_FAST_TIMEOUT_MS,
+      markBackfillFailure: false,
+      budgetMode
+    }).catch(() => {});
   }
 }
 
@@ -3183,7 +3168,6 @@ function scheduleRealtimeTranslation(videoKey, centerIndex) {
     ytRtFastLaneTargets.push(centerIndex + YT_RT_FAST_PREFETCH_AHEAD);
   }
   runFastLane();
-  scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
 }
 
 function scheduleBackfillLane(videoKey, delayMs = YT_RT_BACKFILL_IDLE_DELAY_MS) {
@@ -3408,10 +3392,38 @@ function hasUntranslatedTimelineItems() {
   return ytRtItems.some((item) => item && !item.translation);
 }
 
+function getTranslateBudgetSet(videoKey) {
+  if (!videoKey) return null;
+  let set = ytRtBudgetSourcesByVideo.get(videoKey);
+  if (!set) {
+    set = new Set();
+    ytRtBudgetSourcesByVideo.set(videoKey, set);
+  }
+  return set;
+}
+
+function canConsumeTranslateBudget(videoKey, source, mode = 'normal') {
+  const cleanSource = String(source || '').trim();
+  if (!cleanSource) return false;
+  const set = getTranslateBudgetSet(videoKey);
+  if (!set) return false;
+  if (set.has(cleanSource)) return true;
+  const used = set.size;
+  const reserve = Math.max(
+    0,
+    Math.min(Number(YT_RT_BUDGET_TOTAL) || 0, Number(YT_RT_BUDGET_SEEK_RESERVE) || 0)
+  );
+  const normalCap = Math.max(0, (Number(YT_RT_BUDGET_TOTAL) || 0) - reserve);
+  const cap = mode === 'seek' ? Number(YT_RT_BUDGET_TOTAL) || 0 : normalCap;
+  if (cap <= 0 || used >= cap) return false;
+  set.add(cleanSource);
+  return true;
+}
+
 async function translateTimelineItemByIndex(
   videoKey,
   index,
-  { timeoutMs = 2400, markBackfillFailure = false } = {}
+  { timeoutMs = 2400, markBackfillFailure = false, budgetMode = 'normal' } = {}
 ) {
   const item = ytRtItems[index];
   if (!item) return false;
@@ -3433,6 +3445,9 @@ async function translateTimelineItemByIndex(
 
   let inflight = ytRtTranslationInflight.get(source);
   if (!inflight) {
+    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) {
+      return false;
+    }
     inflight = requestRealtimeSentenceTranslationWithTimeout(source, timeoutMs)
       .then((translated) => {
         const text = String(translated || '').trim();
@@ -3456,12 +3471,18 @@ async function translateTimelineItemByIndex(
     if (markBackfillFailure && item?.id) {
       ytRtBackfillFailedAt.set(item.id, Date.now());
     }
+    if (item.id === ytRtActiveItemId) {
+      renderRealtimeSubtitleOverlay(item);
+    }
     return false;
   }
   if (videoKey !== ytRtTranscriptLoadedVideoKey) return false;
   if (item.translation) return true;
   item.translation = translated;
   if (item?.id) ytRtBackfillFailedAt.delete(item.id);
+  if (item.id === ytRtOverlayPendingItemId) {
+    ytRtOverlayPendingItemId = '';
+  }
   updateRealtimeItemTranslation(item.id, translated);
   if (item.id === ytRtActiveItemId) {
     renderRealtimeSubtitleOverlay(item);
@@ -3548,16 +3569,23 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   ytRtTranscriptLoadedVideoKey = videoKey;
   await ensureRealtimeTranslationCapability();
 
-  if (isYouTubeCcEnabled() && ytRtFullTranscriptTriedVideoKey !== videoKey) {
-    ytRtFullTranscriptTriedVideoKey = videoKey;
-    ytRtStatusText = 'CC 已开启，正在加载全量字幕...';
-    renderRealtimeSubtitleList();
-    const fullLoaded = await tryLoadFullTranscriptOnce(videoKey);
-    if (fullLoaded) return;
+  if (isYouTubeCcEnabled() && !ytRtHasFullTimeline) {
+    const now = Date.now();
+    const nextTryAt = Number(ytRtNextFullTranscriptTryAtByVideo.get(videoKey) || 0);
+    if (now >= nextTryAt) {
+      ytRtFullTranscriptTriedVideoKey = videoKey;
+      ytRtStatusText = 'CC 已开启，正在加载全量字幕...';
+      renderRealtimeSubtitleList();
+      const fullLoaded = await tryLoadFullTranscriptOnce(videoKey);
+      if (fullLoaded) {
+        ytRtNextFullTranscriptTryAtByVideo.delete(videoKey);
+        return;
+      }
+      ytRtNextFullTranscriptTryAtByVideo.set(videoKey, now + YT_RT_FULL_TRANSCRIPT_RETRY_MS);
+    }
   }
 
   if (ytRtHasFullTimeline && ytRtItems.length) {
-    scheduleBackfillLane(videoKey, 60);
     return;
   }
 
@@ -3660,7 +3688,6 @@ async function tryLoadFullTranscriptOnce(videoKey) {
       if (items.length) {
         await applyLoadedRealtimeItems(videoKey, items);
         ytRtHasFullTimeline = true;
-        scheduleBackfillLane(videoKey, 20);
         return true;
       }
     }
@@ -3669,7 +3696,6 @@ async function tryLoadFullTranscriptOnce(videoKey) {
       if (fallbackItems.length) {
         await applyLoadedRealtimeItems(videoKey, fallbackItems);
         ytRtHasFullTimeline = true;
-        scheduleBackfillLane(videoKey, 20);
         return true;
       }
     }
@@ -3920,10 +3946,12 @@ function renderRealtimeSubtitleOverlay(item) {
   const source = String(item.source || '').trim();
   const translation = String(item.translation || '').trim();
   const isActive = item.id === ytRtActiveItemId;
+  const isPending = Boolean(source) && ytRtTranslationInflight.has(source);
   const shouldHoldForSync =
     isActive &&
     !translation &&
-    ytRtOverlayPendingItemId === ytRtActiveItemId;
+    ytRtOverlayPendingItemId === ytRtActiveItemId &&
+    isPending;
 
   if (shouldHoldForSync) {
     sourceEl.textContent = '';
