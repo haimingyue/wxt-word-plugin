@@ -10,6 +10,7 @@ const YT_RT_REOPEN_BTN_ID = 'yt-rt-translate-reopen-btn';
 const YT_RT_WATCH_ACTIVE_CLASS = 'yt-rt-vertical-view-active';
 const YT_RT_TARGET_FULL_CLASS = 'yt-rt-target-full-bleed';
 const YT_RT_TARGET_PLAYER_FULL_CLASS = 'yt-rt-target-player-full-bleed';
+const YT_RT_TARGET_PLAYER_CONTAINER_CLASS = 'yt-rt-target-player-container';
 const YT_RT_MAX_ITEMS = 2000;
 const YT_RT_DEBOUNCE_MS = 120;
 const YT_RT_SEEK_LEAD_SECONDS = 1.0;
@@ -1628,12 +1629,35 @@ function syncRealtimePanelLayout() {
   watchFlexy?.classList?.remove(
     YT_RT_WATCH_ACTIVE_CLASS,
     YT_RT_TARGET_FULL_CLASS,
-    YT_RT_TARGET_PLAYER_FULL_CLASS
+    YT_RT_TARGET_PLAYER_FULL_CLASS,
+    YT_RT_TARGET_PLAYER_CONTAINER_CLASS
   );
 
   if (panel.classList.contains('is-hidden')) {
     if (panel.parentElement !== document.body) {
       document.body.appendChild(panel);
+    }
+    return;
+  }
+  const fullBleedContainer = document.getElementById('full-bleed-container');
+  const playerFullBleedContainer = document.getElementById('player-full-bleed-container');
+  const playerContainer =
+    document.getElementById('player-container-outer') ||
+    document.getElementById('player-container-inner') ||
+    document.getElementById('player');
+  const targetContainer = fullBleedContainer || playerFullBleedContainer || playerContainer || null;
+
+  if (targetContainer) {
+    if (panel.parentElement !== targetContainer) {
+      targetContainer.appendChild(panel);
+    }
+    watchFlexy?.classList?.add(YT_RT_WATCH_ACTIVE_CLASS);
+    if (targetContainer.id === 'full-bleed-container') {
+      watchFlexy?.classList?.add(YT_RT_TARGET_FULL_CLASS);
+    } else if (targetContainer.id === 'player-full-bleed-container') {
+      watchFlexy?.classList?.add(YT_RT_TARGET_PLAYER_FULL_CLASS);
+    } else {
+      watchFlexy?.classList?.add(YT_RT_TARGET_PLAYER_CONTAINER_CLASS);
     }
     return;
   }
@@ -1659,7 +1683,8 @@ function teardownRealtimeSubtitleObserver() {
     ?.classList?.remove(
       YT_RT_WATCH_ACTIVE_CLASS,
       YT_RT_TARGET_FULL_CLASS,
-      YT_RT_TARGET_PLAYER_FULL_CLASS
+      YT_RT_TARGET_PLAYER_FULL_CLASS,
+      YT_RT_TARGET_PLAYER_CONTAINER_CLASS
     );
 }
 
@@ -3245,7 +3270,8 @@ function ensureRealtimeSubtitleUi() {
         ?.classList?.remove(
           YT_RT_WATCH_ACTIVE_CLASS,
           YT_RT_TARGET_FULL_CLASS,
-          YT_RT_TARGET_PLAYER_FULL_CLASS
+          YT_RT_TARGET_PLAYER_FULL_CLASS,
+          YT_RT_TARGET_PLAYER_CONTAINER_CLASS
         );
       const reopenBtn = document.getElementById(YT_RT_REOPEN_BTN_ID);
       if (reopenBtn) reopenBtn.classList.add('is-active');
