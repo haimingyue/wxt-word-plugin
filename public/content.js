@@ -53,6 +53,7 @@ let ytRtPlaybackTimer = 0;
 let ytRtTranscriptLoadedVideoKey = '';
 let ytRtTranscriptLoadingVideoKey = '';
 let ytRtFullTranscriptTriedVideoKey = '';
+let ytRtHasFullTimeline = false;
 let ytRtTranslationJobId = 0;
 let ytRtCanTranslate = null;
 let ytRtAutoCcTriedVideoKey = '';
@@ -1613,6 +1614,7 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtTranscriptLoadedVideoKey = '';
     ytRtTranscriptLoadingVideoKey = '';
     ytRtFullTranscriptTriedVideoKey = '';
+    ytRtHasFullTimeline = false;
     ytRtAutoCcTriedVideoKey = '';
     ytRtLoadingPromise = null;
     ytRtNextLoadAt = 0;
@@ -3033,6 +3035,7 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   if (forceReload) {
     ytRtLastCaption = '';
     ytRtFullTranscriptTriedVideoKey = '';
+    ytRtHasFullTimeline = false;
   }
   if (isYouTubeAdPlaying()) {
     ytRtStatusText = '广告播放中，广告结束后自动读取字幕...';
@@ -3048,6 +3051,10 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
     renderRealtimeSubtitleList();
     const fullLoaded = await tryLoadFullTranscriptOnce(videoKey);
     if (fullLoaded) return;
+  }
+
+  if (ytRtHasFullTimeline && ytRtItems.length) {
+    return;
   }
 
   const subtitleText = getCurrentYoutubeSubtitleText();
@@ -3082,9 +3089,7 @@ function captureRealtimeSubtitleText() {
 }
 
 function getCurrentYoutubeSubtitleText() {
-  const captionRoots = document.querySelectorAll(
-    '.ytp-caption-window-container, .caption-window.ytp-caption-window-bottom, .ytp-caption-segment'
-  );
+  const captionRoots = document.querySelectorAll('.ytp-caption-segment');
   if (!captionRoots.length) return '';
   const parts = [];
   captionRoots.forEach((node) => {
@@ -3150,6 +3155,7 @@ async function tryLoadFullTranscriptOnce(videoKey) {
       const items = mapSubtitleBundleToRealtimeItems(subtitleBundle, videoKey);
       if (items.length) {
         await applyLoadedRealtimeItems(videoKey, items);
+        ytRtHasFullTimeline = true;
         return true;
       }
     }
@@ -3157,6 +3163,7 @@ async function tryLoadFullTranscriptOnce(videoKey) {
       const fallbackItems = await tryLoadSubtitlesViaBridgeFallback(videoKey, track, fallbackUrl);
       if (fallbackItems.length) {
         await applyLoadedRealtimeItems(videoKey, fallbackItems);
+        ytRtHasFullTimeline = true;
         return true;
       }
     }
