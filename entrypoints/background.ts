@@ -166,6 +166,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg?.type === 'deepseek-translate-batch') {
+    deepseekTranslateBatchHandler(msg.payload)
+      .then((res) => sendResponse({ success: true, translations: res }))
+      .catch((err) => sendResponse({ success: false, message: err.message }));
+    return true;
+  }
+
+  if (msg?.type === 'deepseek-translate-grouped') {
+    deepseekTranslateGroupedHandler(msg.payload)
+      .then((res) => sendResponse({ success: true, translations: res }))
+      .catch((err) => sendResponse({ success: false, message: err.message }));
+    return true;
+  }
+
   if (msg?.type === 'deepseek-parse-sentence') {
     deepseekParseSentenceHandler(msg.payload)
       .then((res) => sendResponse({ success: true, message: res }))
@@ -1002,6 +1016,91 @@ async function deepseekTranslateSentenceHandler(payload) {
     { role: 'system', content: prompt },
     { role: 'user', content: sentence }
   ]);
+}
+
+async function deepseekTranslateBatchHandler(payload) {
+  const sentences = Array.isArray(payload?.sentences)
+    ? payload.sentences.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (!sentences.length) throw new Error('缺少批量句子');
+  if (sentences.length > 20) throw new Error('批量句子过多');
+
+  const numbered = sentences.map((sentence, idx) => `${idx + 1}. ${sentence}`).join('\n');
+  const prompt = [
+    '你是中英翻译助手。',
+    '请将多条英文句子逐条翻译为中文，保持自然通顺。',
+    '输出必须是 JSON，且只输出 JSON，不要额外说明。',
+    '格式：{"translations":["译文1","译文2",...]}',
+    'translations 数组长度必须与输入句子数量完全一致，顺序一一对应。'
+  ].join('\n');
+  const raw = await deepseekChat([
+    { role: 'system', content: prompt },
+    { role: 'user', content: `句子列表：\n${numbered}` }
+  ]);
+  const cleaned = String(raw || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '');
+
+  let parsed: any = null;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (_) {
+    // no-op
+  }
+  const translations = Array.isArray(parsed?.translations)
+    ? parsed.translations
+    : Array.isArray(parsed)
+      ? parsed
+      : [];
+  const normalized = translations.map((item) => String(item || '').trim());
+  if (normalized.length !== sentences.length) {
+    throw new Error('批量翻译结果数量不匹配');
+  }
+  return normalized;
+}
+
+async function deepseekTranslateGroupedHandler(payload) {
+  const segments = Array.isArray(payload?.segments)
+    ? payload.segments.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (!segments.length) throw new Error('缺少分组句子');
+  if (segments.length > 40) throw new Error('分组句子过多');
+
+  const numbered = segments.map((sentence, idx) => `[${idx + 1}] ${sentence}`).join('\n');
+  const prompt = [
+    '你是中英翻译助手。',
+    '以下内容是同一段上下文中的连续英文字幕片段，请参考整体语境，逐条翻译成中文。',
+    '每一条必须与输入片段一一对应，不可合并、不可遗漏。',
+    '输出必须是 JSON，且只输出 JSON。',
+    '格式：{"translations":["第1条译文","第2条译文",...]}',
+    'translations 数组长度必须与输入条数完全一致，顺序必须一致。'
+  ].join('\n');
+  const raw = await deepseekChat([
+    { role: 'system', content: prompt },
+    { role: 'user', content: `片段列表：\n${numbered}` }
+  ]);
+  const cleaned = String(raw || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '');
+
+  let parsed: any = null;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (_) {
+    // no-op
+  }
+  const translations = Array.isArray(parsed?.translations)
+    ? parsed.translations
+    : Array.isArray(parsed)
+      ? parsed
+      : [];
+  const normalized = translations.map((item) => String(item || '').trim());
+  if (normalized.length !== segments.length) {
+    throw new Error('分组翻译结果数量不匹配');
+  }
+  return normalized;
 }
 
 async function deepseekParseSentenceHandler(payload) {

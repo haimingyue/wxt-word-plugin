@@ -28,9 +28,20 @@ const YT_RT_AD_RETRY_MS = 1500;
 const YT_RT_HTML_RETRY_COOLDOWN_MS = 6000;
 const YT_RT_HTML_HARD_COOLDOWN_MS = 30000;
 const YT_RT_OVERLAY_POS_KEY = 'yt-rt-overlay-pos-v1';
-const YT_RT_TRANSLATE_BEHIND_WINDOW = 2;
-const YT_RT_TRANSLATE_AHEAD_WINDOW = 10;
-const YT_RT_TRANSLATE_BATCH_LIMIT = 16;
+const YT_RT_FAST_PREFETCH_AHEAD = 1;
+const YT_RT_FAST_TIMEOUT_MS = 4200;
+const YT_RT_ACTIVE_PREFETCH_AHEAD = 1;
+const YT_RT_PLAYBACK_SYNC_MS = 120;
+const YT_RT_BACKFILL_STEP_BATCH = 4;
+const YT_RT_BACKFILL_BATCH_TRANSLATE_SIZE = 100;
+const YT_RT_BACKFILL_BATCH_RPC_SIZE = 20;
+const YT_RT_BACKFILL_GROUP_MAX_SEGMENTS = 18;
+const YT_RT_BACKFILL_GROUP_MIN_SEGMENTS = 6;
+const YT_RT_BACKFILL_GROUP_MAX_CHARS = 1200;
+const YT_RT_BACKFILL_GROUP_MAX_GAP_SECONDS = 3.5;
+const YT_RT_BACKFILL_IDLE_DELAY_MS = 140;
+const YT_RT_BACKFILL_RETRY_COOLDOWN_MS = 1800;
+const YT_RT_BACKFILL_BATCH_TIMEOUT_MS = 9000;
 /**
  * Message protocol:
  * `YT_SUBTITLE_FETCH_REQUEST`: content -> injected(main world)
@@ -57,10 +68,13 @@ let ytRtTranscriptLoadedVideoKey = '';
 let ytRtTranscriptLoadingVideoKey = '';
 let ytRtFullTranscriptTriedVideoKey = '';
 let ytRtHasFullTimeline = false;
-let ytRtTranslationJobId = 0;
-let ytRtTimelineTranslateInFlight = false;
-let ytRtPendingTranslateCenter = -1;
-let ytRtPendingTranslateVideoKey = '';
+let ytRtFastLaneInFlight = false;
+let ytRtFastLaneEpoch = 0;
+let ytRtFastLaneVideoKey = '';
+let ytRtFastLaneTargets = [];
+let ytRtBackfillInFlight = false;
+let ytRtBackfillTimer = 0;
+let ytRtBackfillCursor = 0;
 let ytRtCanTranslate = null;
 let ytRtAutoCcTriedVideoKey = '';
 let ytRtLoadingPromise = null;
@@ -69,6 +83,8 @@ let ytRtAdDetectionStartedAt = 0;
 const ytRtPlayerResponseCache = new Map();
 const ytRtTranslationCache = new Map();
 const ytRtCaptionTrackCache = new Map();
+const ytRtTranslationInflight = new Map();
+const ytRtBackfillFailedAt = new Map();
 const ytCaptionTrackWaiters = [];
 const ytCaptionBridgeFetchWaiters = new Map();
 let ytCaptionBridgeInitialized = false;
@@ -80,6 +96,7 @@ const ytRtHtmlRetryAtByVideo = new Map();
 const ytRtSubtitleBlockedUntilByVideo = new Map();
 let ytRtOverlayPos = null;
 let ytRtOverlayDragBound = false;
+let ytRtOverlayPendingItemId = '';
 
 let meaningRequestId = 0;
 let translationRequestId = 0;
@@ -1628,7 +1645,17 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtSubtitleBlockedUntilByVideo.clear();
     ytRtPlayerResponseCache.clear();
     ytRtCaptionTrackCache.clear();
-    ytRtTranslationJobId += 1;
+    ytRtFastLaneInFlight = false;
+    ytRtFastLaneEpoch += 1;
+    ytRtFastLaneVideoKey = '';
+    ytRtFastLaneTargets = [];
+    ytRtBackfillInFlight = false;
+    ytRtBackfillCursor = 0;
+    clearTimeout(ytRtBackfillTimer);
+    ytRtBackfillTimer = 0;
+    ytRtOverlayPendingItemId = '';
+    ytRtTranslationInflight.clear();
+    ytRtBackfillFailedAt.clear();
     renderRealtimeSubtitleList();
     renderRealtimeSubtitleOverlay(null);
   }
@@ -1700,10 +1727,20 @@ function teardownRealtimeSubtitleObserver() {
   }
   clearTimeout(ytRtDebounceTimer);
   ytRtDebounceTimer = 0;
+  clearTimeout(ytRtBackfillTimer);
+  ytRtBackfillTimer = 0;
+  ytRtOverlayPendingItemId = '';
   clearInterval(ytRtPlaybackTimer);
   ytRtPlaybackTimer = 0;
   ytRtLoadingPromise = null;
   ytRtNextLoadAt = 0;
+  ytRtFastLaneInFlight = false;
+  ytRtFastLaneVideoKey = '';
+  ytRtFastLaneTargets = [];
+  ytRtBackfillInFlight = false;
+  ytRtBackfillCursor = 0;
+  ytRtTranslationInflight.clear();
+  ytRtBackfillFailedAt.clear();
   document
     .querySelector('ytd-watch-flexy')
     ?.classList?.remove(
@@ -1853,7 +1890,7 @@ function startRealtimePlaybackSync() {
   ytRtPlaybackTimer = window.setInterval(() => {
     if (!ytRtEnabled) return;
     syncRealtimeActiveItemByPlayback(true);
-  }, 220);
+  }, YT_RT_PLAYBACK_SYNC_MS);
 }
 
 function getCurrentYouTubeVideoKey() {
@@ -2462,7 +2499,7 @@ function mapSubtitleBundleToRealtimeItems(bundle, videoKey) {
   const rawItems = Array.isArray(bundle?.items) ? bundle.items : [];
   const items = [];
   rawItems.forEach((item, index) => {
-    const text = String(item?.text || '').replace(/\s+/g, ' ').trim();
+    const text = normalizeCaptionText(item?.text || '');
     if (!text) return;
     const start = Number(item?.startTimeSeconds);
     const end = Number(item?.endTimeSeconds);
@@ -2491,11 +2528,10 @@ async function applyLoadedRealtimeItems(videoKey, items) {
   syncRealtimeActiveItemByPlayback(true);
 
   const canTranslate = await ensureRealtimeTranslationCapability();
-  if (!canTranslate) {
+  if (canTranslate === false) {
     renderRealtimeSubtitleList();
-    return;
   }
-  queueTimelineWindowTranslation(videoKey, ytRtActiveIndex);
+  triggerActiveSentenceTranslation(videoKey, ytRtActiveIndex);
 }
 
 function getYouTubePlayerResponse() {
@@ -2912,9 +2948,11 @@ async function ensureRealtimeTranslationCapability() {
     const res = await safeSendMessageAsync({ type: 'deepseek-ready' });
     ytRtCanTranslate = Boolean(res?.success && res?.ready);
   } catch (_) {
-    ytRtCanTranslate = false;
+    // Do not permanently disable translation on transient readiness check failure.
+    ytRtCanTranslate = null;
+    return true;
   }
-  return ytRtCanTranslate;
+  return ytRtCanTranslate !== false;
 }
 
 async function requestRealtimeSentenceTranslation(sentence) {
@@ -2930,6 +2968,55 @@ async function requestRealtimeSentenceTranslation(sentence) {
   return '';
 }
 
+async function requestRealtimeBatchTranslation(sentences) {
+  const payload = Array.isArray(sentences)
+    ? sentences.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (!payload.length) return [];
+
+  const rpcBatchSize = Math.max(1, Number(YT_RT_BACKFILL_BATCH_RPC_SIZE) || 1);
+  const merged = [];
+  for (let i = 0; i < payload.length; i += rpcBatchSize) {
+    const chunk = payload.slice(i, i + rpcBatchSize);
+    try {
+      const res = await safeSendMessageAsync({
+        type: 'deepseek-translate-batch',
+        payload: { sentences: chunk }
+      });
+      const translations = Array.isArray(res?.translations)
+        ? res.translations.map((item) => String(item || '').trim())
+        : [];
+      if (translations.length !== chunk.length) {
+        return [];
+      }
+      merged.push(...translations);
+    } catch (_) {
+      return [];
+    }
+  }
+  return merged.length === payload.length ? merged : [];
+}
+
+async function requestRealtimeGroupedTranslation(sentences) {
+  const payload = Array.isArray(sentences)
+    ? sentences.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (!payload.length) return [];
+  try {
+    const res = await safeSendMessageAsync({
+      type: 'deepseek-translate-grouped',
+      payload: { segments: payload }
+    });
+    const translations = Array.isArray(res?.translations)
+      ? res.translations.map((item) => String(item || '').trim())
+      : [];
+    if (translations.length === payload.length) {
+      return translations;
+    }
+  } catch (_) {}
+  return [];
+}
+
 function syncRealtimeActiveItemByPlayback(shouldScroll = true) {
   if (!ytRtItems.length) return;
   const seconds = getCurrentVideoTimeSeconds();
@@ -2940,9 +3027,10 @@ function syncRealtimeActiveItemByPlayback(shouldScroll = true) {
 
   ytRtActiveIndex = index;
   ytRtActiveItemId = ytRtItems[index]?.id || '';
+  ytRtOverlayPendingItemId = ytRtActiveItemId;
   renderRealtimeSubtitleOverlay(ytRtItems[index] || null);
   updateRealtimeActiveRow(shouldScroll);
-  queueTimelineWindowTranslation(ytRtTranscriptLoadedVideoKey, index);
+  triggerActiveSentenceTranslation(ytRtTranscriptLoadedVideoKey, index);
 }
 
 function findRealtimeItemIndexByTime(seconds) {
@@ -2969,9 +3057,91 @@ function setRealtimeActiveById(itemId, shouldScroll = true) {
   if (index < 0) return;
   ytRtActiveIndex = index;
   ytRtActiveItemId = itemId;
+  ytRtOverlayPendingItemId = ytRtActiveItemId;
   renderRealtimeSubtitleOverlay(ytRtItems[index] || null);
   updateRealtimeActiveRow(shouldScroll);
-  queueTimelineWindowTranslation(ytRtTranscriptLoadedVideoKey, index);
+  triggerActiveSentenceTranslation(ytRtTranscriptLoadedVideoKey, index);
+}
+
+function triggerActiveSentenceTranslation(videoKey, index) {
+  if (!ytRtEnabled) return;
+  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
+  if (!Number.isInteger(index) || index < 0 || index >= ytRtItems.length) return;
+  const item = ytRtItems[index];
+  if (!item) return;
+
+  const source = String(item.source || '').trim();
+  if (!source) return;
+  const cached = ytRtTranslationCache.get(source);
+  if (cached) {
+    item.translation = cached;
+    if (item.id === ytRtActiveItemId) renderRealtimeSubtitleOverlay(item);
+    return;
+  }
+
+  let inflight = ytRtTranslationInflight.get(source);
+  if (!inflight) {
+    inflight = requestRealtimeSentenceTranslationWithTimeout(source, YT_RT_FAST_TIMEOUT_MS)
+      .then((translated) => {
+        const text = String(translated || '').trim();
+        if (text) {
+          ytRtTranslationCache.set(source, text);
+          if (ytRtTranslationCache.size > 1200) {
+            const firstKey = ytRtTranslationCache.keys().next().value;
+            if (firstKey) ytRtTranslationCache.delete(firstKey);
+          }
+        }
+        return text;
+      })
+      .finally(() => {
+        ytRtTranslationInflight.delete(source);
+      });
+    ytRtTranslationInflight.set(source, inflight);
+  }
+
+  inflight.then((translated) => {
+    if (!translated) return;
+    if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
+    const target = ytRtItems[index];
+    if (!target || target.id !== item.id) return;
+    target.translation = translated;
+    if (target.id === ytRtActiveItemId) renderRealtimeSubtitleOverlay(target);
+  });
+
+  prefetchUpcomingRealtimeTranslations(videoKey, index);
+}
+
+function prefetchUpcomingRealtimeTranslations(videoKey, centerIndex) {
+  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
+  if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return;
+
+  for (let i = 1; i <= YT_RT_ACTIVE_PREFETCH_AHEAD; i += 1) {
+    const idx = centerIndex + i;
+    if (idx < 0 || idx >= ytRtItems.length) break;
+    const item = ytRtItems[idx];
+    if (!item || item.translation) continue;
+    const source = String(item.source || '').trim();
+    if (!source) continue;
+    if (ytRtTranslationCache.has(source) || ytRtTranslationInflight.has(source)) continue;
+
+    const inflight = requestRealtimeSentenceTranslationWithTimeout(source, YT_RT_FAST_TIMEOUT_MS)
+      .then((translated) => {
+        const text = String(translated || '').trim();
+        if (!text) return '';
+        ytRtTranslationCache.set(source, text);
+        if (ytRtTranslationCache.size > 1200) {
+          const firstKey = ytRtTranslationCache.keys().next().value;
+          if (firstKey) ytRtTranslationCache.delete(firstKey);
+        }
+        if (!item.translation) item.translation = text;
+        return text;
+      })
+      .finally(() => {
+        ytRtTranslationInflight.delete(source);
+      });
+
+    ytRtTranslationInflight.set(source, inflight);
+  }
 }
 
 function updateRealtimeActiveRow(shouldScroll = false) {
@@ -3001,84 +3171,358 @@ function updateRealtimeItemTranslation(itemId, translation) {
   rowTranslation.classList.toggle('is-empty', !translation);
 }
 
-function queueTimelineWindowTranslation(videoKey, centerIndex) {
+function scheduleRealtimeTranslation(videoKey, centerIndex) {
   if (!ytRtEnabled) return;
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return;
-  if (ytRtCanTranslate === false) return;
-  ytRtPendingTranslateVideoKey = videoKey;
-  ytRtPendingTranslateCenter = centerIndex;
-  if (ytRtTimelineTranslateInFlight) return;
-  flushTimelineWindowTranslationQueue();
+
+  ytRtFastLaneVideoKey = videoKey;
+  ytRtFastLaneEpoch += 1;
+  ytRtFastLaneTargets = [centerIndex];
+  if (centerIndex + YT_RT_FAST_PREFETCH_AHEAD < ytRtItems.length) {
+    ytRtFastLaneTargets.push(centerIndex + YT_RT_FAST_PREFETCH_AHEAD);
+  }
+  runFastLane();
+  scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
 }
 
-async function flushTimelineWindowTranslationQueue() {
-  if (ytRtTimelineTranslateInFlight) return;
-  ytRtTimelineTranslateInFlight = true;
+function scheduleBackfillLane(videoKey, delayMs = YT_RT_BACKFILL_IDLE_DELAY_MS) {
+  if (!ytRtEnabled) return;
+  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
+  if (!ytRtHasFullTimeline || !ytRtItems.length) return;
+  clearTimeout(ytRtBackfillTimer);
+  ytRtBackfillTimer = window.setTimeout(() => {
+    runBackfillLane(videoKey).catch(() => {});
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+async function runFastLane() {
+  if (ytRtFastLaneInFlight) return;
+  ytRtFastLaneInFlight = true;
   try {
-    while (
-      ytRtPendingTranslateCenter >= 0 &&
-      ytRtPendingTranslateVideoKey &&
-      ytRtPendingTranslateVideoKey === ytRtTranscriptLoadedVideoKey
-    ) {
-      const center = ytRtPendingTranslateCenter;
-      const videoKey = ytRtPendingTranslateVideoKey;
-      ytRtPendingTranslateCenter = -1;
-      ytRtPendingTranslateVideoKey = '';
-      await translateRealtimeItems(videoKey, center);
+    while (ytRtFastLaneTargets.length) {
+      const epoch = ytRtFastLaneEpoch;
+      const videoKey = ytRtFastLaneVideoKey;
+      if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
+      const index = ytRtFastLaneTargets.shift();
+      if (!Number.isInteger(index)) continue;
+      await translateTimelineItemByIndex(videoKey, index, {
+        timeoutMs: YT_RT_FAST_TIMEOUT_MS,
+        markBackfillFailure: false
+      });
+      // Active moved while request in-flight; switch to newest targets immediately.
+      if (epoch !== ytRtFastLaneEpoch) {
+        continue;
+      }
     }
   } finally {
-    ytRtTimelineTranslateInFlight = false;
+    ytRtFastLaneInFlight = false;
+    if (ytRtFastLaneTargets.length) {
+      window.setTimeout(() => runFastLane(), 0);
+    }
   }
 }
 
-async function translateRealtimeItems(videoKey, centerIndex = -1) {
-  if (!ytRtItems.length) return;
-  if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return;
-  const jobId = ++ytRtTranslationJobId;
-  const start = Math.max(0, centerIndex - YT_RT_TRANSLATE_BEHIND_WINDOW);
-  const end = Math.min(ytRtItems.length - 1, centerIndex + YT_RT_TRANSLATE_AHEAD_WINDOW);
-
-  const indices = [centerIndex];
-  for (let i = centerIndex + 1; i <= end; i += 1) {
-    indices.push(i);
-  }
-  for (let i = centerIndex - 1; i >= start; i -= 1) {
-    indices.push(i);
+async function runBackfillLane(videoKey) {
+  if (ytRtBackfillInFlight) return;
+  if (!ytRtHasFullTimeline || !ytRtItems.length) return;
+  if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
+  if (ytRtFastLaneInFlight) {
+    scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
+    return;
   }
 
-  let translatedCount = 0;
-  for (const idx of indices) {
-    if (jobId !== ytRtTranslationJobId) return;
-    if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
-    if (translatedCount >= YT_RT_TRANSLATE_BATCH_LIMIT) break;
-    const item = ytRtItems[idx];
-    if (!item) continue;
-    if (item.translation) continue;
-    const cached = ytRtTranslationCache.get(item.source);
-    if (cached) {
+  const targets = collectBackfillTargets(YT_RT_BACKFILL_BATCH_TRANSLATE_SIZE);
+  if (!targets.length) return;
+
+  ytRtBackfillInFlight = true;
+  try {
+    const pendingEntries = collectBackfillPendingEntries(targets);
+    if (!pendingEntries.length) return;
+    const groups = buildBackfillGroups(pendingEntries);
+    if (!groups.length) return;
+
+    for (const group of groups) {
+      if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
+      if (ytRtFastLaneInFlight) {
+        scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
+        return;
+      }
+      const translations = await requestRealtimeGroupedTranslationWithTimeout(
+        group.map((entry) => entry.source),
+        YT_RT_BACKFILL_BATCH_TIMEOUT_MS
+      );
+      if (translations.length === group.length) {
+        applyBackfillTranslations(videoKey, group, translations);
+        continue;
+      }
+
+      // Group request failed: fall back to segmented batch, then per-item.
+      const segmented = await requestRealtimeBatchTranslationWithTimeout(
+        group.map((entry) => entry.source),
+        YT_RT_BACKFILL_BATCH_TIMEOUT_MS
+      );
+      if (segmented.length === group.length) {
+        applyBackfillTranslations(videoKey, group, segmented);
+        continue;
+      }
+
+      for (const entry of group) {
+        if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
+        if (ytRtFastLaneInFlight) {
+          scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
+          return;
+        }
+        await translateTimelineItemByIndex(videoKey, entry.index, {
+          timeoutMs: 2600,
+          markBackfillFailure: true
+        });
+      }
+    }
+  } finally {
+    ytRtBackfillInFlight = false;
+    if (videoKey === ytRtTranscriptLoadedVideoKey && hasUntranslatedTimelineItems()) {
+      scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
+    }
+  }
+}
+
+function collectBackfillPendingEntries(targets) {
+  const now = Date.now();
+  const entries = [];
+  for (const index of targets) {
+    const item = ytRtItems[index];
+    if (!item || item.translation) continue;
+    const source = String(item.source || '').trim();
+    if (!source) continue;
+    if (ytRtTranslationCache.has(source)) {
+      const cached = ytRtTranslationCache.get(source);
       item.translation = cached;
       updateRealtimeItemTranslation(item.id, cached);
-      if (item.id === ytRtActiveItemId) {
-        renderRealtimeSubtitleOverlay(item);
-      }
       continue;
     }
-    const translated = await requestRealtimeSentenceTranslation(item.source);
-    if (!translated) continue;
-    item.translation = translated;
-    ytRtTranslationCache.set(item.source, translated);
+    if (ytRtTranslationInflight.has(source)) continue;
+    const failedAt = Number(ytRtBackfillFailedAt.get(item.id) || 0);
+    if (failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) continue;
+    entries.push({
+      index,
+      id: item.id,
+      source,
+      start: Number(item.videoTimeSeconds || 0),
+      end: Number(item.endTimeSeconds || 0)
+    });
+  }
+  return entries;
+}
+
+function buildBackfillGroups(entries) {
+  if (!entries.length) return [];
+  const groups = [];
+  let current = [];
+  let currentChars = 0;
+
+  const pushCurrent = () => {
+    if (current.length) groups.push(current);
+    current = [];
+    currentChars = 0;
+  };
+
+  entries.forEach((entry) => {
+    const source = String(entry.source || '');
+    const prev = current.length ? current[current.length - 1] : null;
+    const prevEnd = Number(prev?.end || 0);
+    const nextStart = Number(entry.start || 0);
+    const gap = Number.isFinite(prevEnd) && Number.isFinite(nextStart) ? nextStart - prevEnd : 0;
+    const wouldExceedSegments = current.length >= YT_RT_BACKFILL_GROUP_MAX_SEGMENTS;
+    const wouldExceedChars =
+      currentChars + source.length > YT_RT_BACKFILL_GROUP_MAX_CHARS && current.length > 0;
+    const overGap = current.length > 0 && gap > YT_RT_BACKFILL_GROUP_MAX_GAP_SECONDS;
+    const punctuationBoundary =
+      current.length >= YT_RT_BACKFILL_GROUP_MIN_SEGMENTS &&
+      /[.!?。！？…]["')\]]*\s*$/.test(String(prev?.source || ''));
+
+    if (wouldExceedSegments || wouldExceedChars || overGap || punctuationBoundary) {
+      pushCurrent();
+    }
+    current.push(entry);
+    currentChars += source.length;
+  });
+
+  pushCurrent();
+  return groups;
+}
+
+function applyBackfillTranslations(videoKey, entries, translations) {
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
+    const translated = String(translations[i] || '').trim();
+    if (!translated) {
+      ytRtBackfillFailedAt.set(entry.id, Date.now());
+      continue;
+    }
+    if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
+    const item = ytRtItems[entry.index];
+    if (!item || item.id !== entry.id) continue;
+    if (item.translation) continue;
+    ytRtTranslationCache.set(entry.source, translated);
     if (ytRtTranslationCache.size > 1200) {
       const firstKey = ytRtTranslationCache.keys().next().value;
       if (firstKey) ytRtTranslationCache.delete(firstKey);
     }
+    item.translation = translated;
+    ytRtBackfillFailedAt.delete(entry.id);
     updateRealtimeItemTranslation(item.id, translated);
     if (item.id === ytRtActiveItemId) {
       renderRealtimeSubtitleOverlay(item);
     }
-    translatedCount += 1;
-    await new Promise((resolve) => window.setTimeout(resolve, 60));
   }
+}
+
+function collectBackfillTargets(maxCount = YT_RT_BACKFILL_STEP_BATCH) {
+  const total = ytRtItems.length;
+  if (!total) return [];
+  const now = Date.now();
+  const targets = [];
+  let cursor = Number.isInteger(ytRtBackfillCursor) ? ytRtBackfillCursor : 0;
+  cursor = ((cursor % total) + total) % total;
+
+  const limit = Math.max(1, Number(maxCount) || 1);
+  for (let step = 0; step < total && targets.length < limit; step += 1) {
+    const index = (cursor + step) % total;
+    const item = ytRtItems[index];
+    if (!item || item.translation) continue;
+    const source = String(item.source || '').trim();
+    if (!source) continue;
+    if (ytRtTranslationCache.has(source)) continue;
+    if (ytRtTranslationInflight.has(source)) continue;
+    const failedAt = Number(ytRtBackfillFailedAt.get(item.id) || 0);
+    if (failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) continue;
+    targets.push(index);
+  }
+
+  ytRtBackfillCursor = (cursor + Math.max(1, targets.length || limit)) % total;
+  return targets;
+}
+
+function hasUntranslatedTimelineItems() {
+  return ytRtItems.some((item) => item && !item.translation);
+}
+
+async function translateTimelineItemByIndex(
+  videoKey,
+  index,
+  { timeoutMs = 2400, markBackfillFailure = false } = {}
+) {
+  const item = ytRtItems[index];
+  if (!item) return false;
+  if (videoKey !== ytRtTranscriptLoadedVideoKey) return false;
+  if (item.translation) return true;
+
+  const source = String(item.source || '').trim();
+  if (!source) return false;
+
+  const cached = ytRtTranslationCache.get(source);
+  if (cached) {
+    item.translation = cached;
+    updateRealtimeItemTranslation(item.id, cached);
+    if (item.id === ytRtActiveItemId) {
+      renderRealtimeSubtitleOverlay(item);
+    }
+    return true;
+  }
+
+  let inflight = ytRtTranslationInflight.get(source);
+  if (!inflight) {
+    inflight = requestRealtimeSentenceTranslationWithTimeout(source, timeoutMs)
+      .then((translated) => {
+        const text = String(translated || '').trim();
+        if (text) {
+          ytRtTranslationCache.set(source, text);
+          if (ytRtTranslationCache.size > 1200) {
+            const firstKey = ytRtTranslationCache.keys().next().value;
+            if (firstKey) ytRtTranslationCache.delete(firstKey);
+          }
+        }
+        return text;
+      })
+      .finally(() => {
+        ytRtTranslationInflight.delete(source);
+      });
+    ytRtTranslationInflight.set(source, inflight);
+  }
+
+  const translated = await inflight;
+  if (!translated) {
+    if (markBackfillFailure && item?.id) {
+      ytRtBackfillFailedAt.set(item.id, Date.now());
+    }
+    return false;
+  }
+  if (videoKey !== ytRtTranscriptLoadedVideoKey) return false;
+  if (item.translation) return true;
+  item.translation = translated;
+  if (item?.id) ytRtBackfillFailedAt.delete(item.id);
+  updateRealtimeItemTranslation(item.id, translated);
+  if (item.id === ytRtActiveItemId) {
+    renderRealtimeSubtitleOverlay(item);
+  }
+  return true;
+}
+
+async function requestRealtimeSentenceTranslationWithTimeout(sentence, timeoutMs) {
+  const timeout = Math.max(400, Number(timeoutMs) || 1200);
+  let timedOut = false;
+  const timeoutPromise = new Promise((resolve) => {
+    window.setTimeout(() => {
+      timedOut = true;
+      resolve('');
+    }, timeout);
+  });
+  const translated = await Promise.race([requestRealtimeSentenceTranslation(sentence), timeoutPromise]);
+  if (timedOut) return '';
+  return String(translated || '').trim();
+}
+
+async function requestRealtimeBatchTranslationWithTimeout(sentences, timeoutMs) {
+  const payload = Array.isArray(sentences)
+    ? sentences.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (!payload.length) return [];
+  const timeout = Math.max(600, Number(timeoutMs) || 2400);
+  let timedOut = false;
+  const timeoutPromise = new Promise((resolve) => {
+    window.setTimeout(() => {
+      timedOut = true;
+      resolve([]);
+    }, timeout);
+  });
+  const translated = await Promise.race([
+    requestRealtimeBatchTranslation(payload),
+    timeoutPromise
+  ]);
+  if (timedOut) return [];
+  return Array.isArray(translated) ? translated.map((item) => String(item || '').trim()) : [];
+}
+
+async function requestRealtimeGroupedTranslationWithTimeout(sentences, timeoutMs) {
+  const payload = Array.isArray(sentences)
+    ? sentences.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (!payload.length) return [];
+  const timeout = Math.max(800, Number(timeoutMs) || 2800);
+  let timedOut = false;
+  const timeoutPromise = new Promise((resolve) => {
+    window.setTimeout(() => {
+      timedOut = true;
+      resolve([]);
+    }, timeout);
+  });
+  const translated = await Promise.race([
+    requestRealtimeGroupedTranslation(payload),
+    timeoutPromise
+  ]);
+  if (timedOut) return [];
+  return Array.isArray(translated) ? translated.map((item) => String(item || '').trim()) : [];
 }
 
 function loadRealtimeTranscript(forceReload = false) {
@@ -3128,7 +3572,7 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   ytRtLastCaption = subtitleText;
   ytRtStatusText = '';
   const currentTime = getCurrentVideoTimeSeconds();
-  queueRealtimeTranslation(subtitleText, currentTime);
+  pushRealtimeSourceOnlyItem(subtitleText, currentTime);
 }
 
 function scheduleRealtimeSubtitleCapture() {
@@ -3424,6 +3868,39 @@ function pushRealtimeTranslationItem(source, translation, videoTimeSeconds = -1)
   renderRealtimeSubtitleOverlay(ytRtItems[ytRtItems.length - 1]);
 }
 
+function pushRealtimeSourceOnlyItem(source, videoTimeSeconds = -1) {
+  const cleanSource = String(source || '').trim();
+  if (!cleanSource) return;
+  const canMergeWithLast =
+    ytRtItems.length &&
+    ytRtItems[ytRtItems.length - 1].source === cleanSource &&
+    Math.abs(
+      Number(ytRtItems[ytRtItems.length - 1].videoTimeSeconds || -1) -
+        Number(videoTimeSeconds || -1)
+    ) <= 1.5;
+
+  if (canMergeWithLast) {
+    if (Number.isFinite(videoTimeSeconds) && videoTimeSeconds >= 0) {
+      ytRtItems[ytRtItems.length - 1].videoTimeSeconds = videoTimeSeconds;
+    }
+  } else {
+    ytRtItems.push({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      source: cleanSource,
+      translation: '',
+      videoTimeSeconds: Number.isFinite(videoTimeSeconds) ? videoTimeSeconds : -1,
+      createdAt: Date.now()
+    });
+    if (ytRtItems.length > YT_RT_MAX_ITEMS) {
+      ytRtItems = ytRtItems.slice(-YT_RT_MAX_ITEMS);
+    }
+  }
+
+  ytRtActiveItemId = ytRtItems[ytRtItems.length - 1]?.id || '';
+  renderRealtimeSubtitleList();
+  syncRealtimeActiveItemByPlayback(false);
+}
+
 function renderRealtimeSubtitleOverlay(item) {
   const overlay = document.getElementById(YT_RT_OVERLAY_ID);
   if (!overlay) return;
@@ -3436,11 +3913,26 @@ function renderRealtimeSubtitleOverlay(item) {
     overlay.classList.remove('is-active');
     return;
   }
-  sourceEl.textContent = item.source;
+
+  const source = String(item.source || '').trim();
   const translation = String(item.translation || '').trim();
+  const isActive = item.id === ytRtActiveItemId;
+  const shouldHoldForSync =
+    isActive &&
+    !translation &&
+    ytRtOverlayPendingItemId === ytRtActiveItemId;
+
+  if (shouldHoldForSync) {
+    sourceEl.textContent = '';
+    translationEl.textContent = '';
+    translationEl.style.display = 'none';
+    overlay.classList.remove('is-active');
+    return;
+  }
+
+  sourceEl.textContent = source;
   translationEl.textContent = translation;
-  translationEl.style.display =
-    ytRtCanTranslate === false || !translation ? 'none' : 'block';
+  translationEl.style.display = ytRtCanTranslate === false || !translation ? 'none' : 'block';
   overlay.classList.add('is-active');
 }
 
@@ -3491,14 +3983,6 @@ function renderRealtimeSubtitleList() {
       startEcdictLookup(word, anchorRect);
     });
 
-    const translation = document.createElement('div');
-    translation.className = 'yt-rt-item__translation';
-    translation.textContent = item.translation || '';
-    translation.classList.toggle('is-empty', !item.translation);
-    if (ytRtCanTranslate === false) {
-      translation.style.display = 'none';
-    }
-
     row.addEventListener('click', (event) => {
       if (event.target?.closest?.('.yt-rt-item__play')) return;
       setRealtimeActiveById(item.id, false);
@@ -3506,9 +3990,6 @@ function renderRealtimeSubtitleList() {
 
     row.appendChild(playBtn);
     row.appendChild(source);
-    if (ytRtCanTranslate !== false) {
-      row.appendChild(translation);
-    }
     listEl.appendChild(row);
   });
 }
