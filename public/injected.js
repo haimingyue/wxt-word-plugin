@@ -195,19 +195,28 @@
     if (
       text.includes('consent.youtube.com') ||
       text.includes('before you continue') ||
-      text.includes('consent.google.com')
+      text.includes('consent.google.com') ||
+      text.includes('consent.googleusercontent.com')
     ) {
       return 'CONSENT_REQUIRED';
     }
     if (
       text.includes('/sorry/') ||
+      text.includes('google.com/sorry') ||
+      text.includes('/sorry/index') ||
       text.includes('captcha') ||
       text.includes('unusual traffic') ||
-      text.includes('recaptcha')
+      text.includes('recaptcha') ||
+      text.includes('our systems have detected unusual traffic') ||
+      text.includes('pardon the interruption')
     ) {
       return 'CAPTCHA_DETECTED';
     }
-    if (text.includes('sign in') || text.includes('accounts.google.com')) {
+    if (
+      text.includes('sign in') ||
+      text.includes('accounts.google.com') ||
+      text.includes('servicelogin')
+    ) {
       return 'LOGIN_REQUIRED';
     }
     return 'UNKNOWN_HTML';
@@ -224,6 +233,14 @@
       head.includes('<html') ||
       head.includes('consent.youtube.com') ||
       head.includes('before you continue') ||
+      head.includes('consent.googleusercontent.com') ||
+      head.includes('google.com/sorry') ||
+      head.includes('/sorry/index') ||
+      head.includes('our systems have detected unusual traffic') ||
+      head.includes('pardon the interruption') ||
+      head.includes('servicelogin') ||
+      head.includes('youtube.com/error') ||
+      head.includes('www.youtube.com/error') ||
       head.includes('captcha') ||
       head.includes('sign in')
     );

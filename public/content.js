@@ -22,6 +22,7 @@ const YT_CAPTION_BRIDGE_TIMEOUT_MS = 2400;
 const YT_CAPTION_BRIDGE_FETCH_TIMEOUT_MS = 4200;
 const YT_PAGE_FETCH_BACKOFF_MS = [400, 900, 1800];
 const YT_PERF_SCAN_DELAYS_MS = [500, 1000, 2000];
+const YT_RT_AD_RETRY_MS = 1500;
 /**
  * Message protocol:
  * `YT_SUBTITLE_FETCH_REQUEST`: content -> injected(main world)
@@ -51,6 +52,7 @@ let ytRtCanTranslate = null;
 let ytRtAutoCcTriedVideoKey = '';
 let ytRtLoadingPromise = null;
 let ytRtNextLoadAt = 0;
+let ytRtAdDetectionStartedAt = 0;
 const ytRtPlayerResponseCache = new Map();
 const ytRtTranslationCache = new Map();
 const ytRtCaptionTrackCache = new Map();
@@ -1384,6 +1386,13 @@ function isLikelyHtmlResponse(contentType, rawText) {
     head.includes('<!doctype html') ||
     head.includes('<html') ||
     head.includes('consent.youtube.com') ||
+    head.includes('consent.googleusercontent.com') ||
+    head.includes('www.youtube.com/error') ||
+    head.includes('servicelogin') ||
+    head.includes('our systems have detected unusual traffic') ||
+    head.includes('pardon the interruption') ||
+    head.includes('google.com/sorry') ||
+    head.includes('/sorry/index') ||
     head.includes('/sorry/') ||
     head.includes('captcha') ||
     head.includes('sign in')
@@ -1396,20 +1405,32 @@ function classifyHtmlReason(contentType, rawText) {
   if (
     text.includes('consent.youtube.com') ||
     text.includes('before you continue') ||
-    text.includes('consent.google.com')
+    text.includes('consent.google.com') ||
+    text.includes('consent.googleusercontent.com')
   ) {
     return 'CONSENT_REQUIRED';
   }
   if (
     text.includes('/sorry/') ||
+    text.includes('google.com/sorry') ||
+    text.includes('/sorry/index') ||
     text.includes('captcha') ||
     text.includes('unusual traffic') ||
-    text.includes('recaptcha')
+    text.includes('recaptcha') ||
+    text.includes('our systems have detected unusual traffic') ||
+    text.includes('pardon the interruption')
   ) {
     return 'CAPTCHA_DETECTED';
   }
-  if (text.includes('sign in') || text.includes('accounts.google.com')) {
+  if (
+    text.includes('sign in') ||
+    text.includes('accounts.google.com') ||
+    text.includes('servicelogin')
+  ) {
     return 'LOGIN_REQUIRED';
+  }
+  if (text.includes('www.youtube.com/error') || text.includes('youtube.com/error')) {
+    return 'UNKNOWN_HTML';
   }
   return 'UNKNOWN_HTML';
 }
@@ -1419,13 +1440,19 @@ function getTimedtextUrlSummary(rawUrl) {
     const url = new URL(String(rawUrl || ''), location.origin);
     if (!url.pathname.includes('/api/timedtext')) return null;
     const pick = (name) => String(url.searchParams.get(name) || '');
+    const expireRaw = pick('expire');
+    const expireSec = Number(expireRaw);
+    const nowSec = Date.now() / 1000;
     return {
       v: pick('v'),
       lang: pick('lang'),
       tlang: pick('tlang'),
       fmt: pick('fmt'),
       c: pick('c'),
-      hasExpire: Boolean(pick('expire')),
+      hasExpire: Boolean(expireRaw),
+      expireAtSec: Number.isFinite(expireSec) ? expireSec : 0,
+      isExpired: Number.isFinite(expireSec) ? expireSec <= nowSec : false,
+      isNearExpiry: Number.isFinite(expireSec) ? expireSec - nowSec <= 45 : false,
       hasSignature: Boolean(pick('signature') || pick('sig') || pick('lsig')),
       hasPot: Boolean(pick('pot')),
       hasSparams: Boolean(pick('sparams'))
@@ -1433,6 +1460,24 @@ function getTimedtextUrlSummary(rawUrl) {
   } catch (_) {
     return null;
   }
+}
+
+function getTimedtextExpireState(rawUrl) {
+  const summary = getTimedtextUrlSummary(rawUrl);
+  if (!summary) {
+    return {
+      hasExpire: false,
+      isExpired: false,
+      isNearExpiry: false,
+      expireAtSec: 0
+    };
+  }
+  return {
+    hasExpire: Boolean(summary.hasExpire),
+    isExpired: Boolean(summary.isExpired),
+    isNearExpiry: Boolean(summary.isNearExpiry),
+    expireAtSec: Number(summary.expireAtSec || 0)
+  };
 }
 
 function shouldTryPageFetch(rawUrl) {
@@ -1647,6 +1692,59 @@ function getCurrentYouTubeVideoKey() {
     return String(url.pathname.split('/')[2] || '').trim();
   }
   return '';
+}
+
+function isYouTubeAdPlaying() {
+  const now = Date.now();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  let strongSignal = false;
+  let weakSignal = false;
+
+  try {
+    const html5Player = document.querySelector('.html5-video-player');
+    if (html5Player?.classList?.contains('ad-showing')) {
+      strongSignal = true;
+    }
+  } catch (_) {}
+  try {
+    const moviePlayer = document.getElementById('movie_player');
+    if (moviePlayer?.classList?.contains?.('ad-showing')) {
+      strongSignal = true;
+    }
+    if (typeof moviePlayer?.getAdState === 'function') {
+      const adState = moviePlayer.getAdState();
+      if (adState === 1 || adState === true) {
+        strongSignal = true;
+      }
+    }
+  } catch (_) {}
+  const adOverlay = document.querySelector('.ytp-ad-player-overlay, .video-ads.ytp-ad-module');
+  const adSkip = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+  if (isVisible(adOverlay) || isVisible(adSkip)) {
+    weakSignal = true;
+  }
+
+  if (strongSignal || weakSignal) {
+    if (!ytRtAdDetectionStartedAt) {
+      ytRtAdDetectionStartedAt = now;
+    }
+    const adDurationMs = now - ytRtAdDetectionStartedAt;
+    if (!strongSignal && adDurationMs > 12000) {
+      // Weak ad markers can remain in DOM; avoid sticky "ad playing" false positives.
+      ytRtAdDetectionStartedAt = 0;
+      return false;
+    }
+    return true;
+  }
+
+  ytRtAdDetectionStartedAt = 0;
+  return false;
 }
 
 function initYouTubeCaptionBridge() {
@@ -1980,20 +2078,38 @@ async function buildPageContextPayload(videoId, track, fallbackUrl) {
     responses: [],
     timings: {
       pageFetchMs: 0
+    },
+    adSignals: {
+      adPlayingAtStart: isYouTubeAdPlaying(),
+      adPlayingAtEnd: false
     }
   };
   const startAt = Date.now();
   const seen = new Set();
   const candidates = [];
+  const skippedCandidates = [];
   const pushCandidate = (baseUrl, source, languageCode, isAsr) => {
     const key = String(baseUrl || '').trim();
     if (!key || seen.has(key)) return;
+    const expire = getTimedtextExpireState(key);
+    const isPerfSource = String(source || '').toUpperCase().startsWith('PERF_ENTRY');
+    if (isPerfSource && expire.isExpired) {
+      skippedCandidates.push({
+        source,
+        reason: 'PERF_ENTRY_EXPIRED',
+        timedtext: getTimedtextUrlSummary(key)
+      });
+      return;
+    }
     seen.add(key);
+    const priority = source === 'PLAYER_RESPONSE' ? 0 : expire.isNearExpiry ? 2 : 1;
     candidates.push({
       baseUrl: key,
       source,
       languageCode: String(languageCode || '').trim(),
-      isAsr: Boolean(isAsr)
+      isAsr: Boolean(isAsr),
+      expire,
+      priority
     });
   };
 
@@ -2005,16 +2121,23 @@ async function buildPageContextPayload(videoId, track, fallbackUrl) {
   }
   const perfUrl = await findTimedtextUrlFromPerformanceWithRetry(videoId);
   if (perfUrl) {
-    pushCandidate(perfUrl, 'PERF_ENTRY', '', false);
+    pushCandidate(perfUrl, 'PERF_ENTRY_SCAN', '', false);
   }
+
+  candidates.sort((a, b) => a.priority - b.priority);
 
   payload.candidates = candidates.map((item, index) => ({
     index,
     source: item.source,
     languageCode: item.languageCode,
     isAsr: item.isAsr,
+    priority: item.priority,
+    expire: item.expire,
     timedtext: getTimedtextUrlSummary(item.baseUrl)
   }));
+  if (skippedCandidates.length) {
+    payload.skippedCandidates = skippedCandidates.slice(0, 8);
+  }
 
   for (let i = 0; i < candidates.length; i += 1) {
     const candidate = candidates[i];
@@ -2057,6 +2180,7 @@ async function buildPageContextPayload(videoId, track, fallbackUrl) {
     }
   }
   payload.timings.pageFetchMs = Date.now() - startAt;
+  payload.adSignals.adPlayingAtEnd = isYouTubeAdPlaying();
   return payload;
 }
 
@@ -2111,9 +2235,15 @@ function isSubtitleBundleHtmlFailure(bundle) {
 function collectSubtitleBaseUrlCandidates(track, fallbackUrl) {
   const urls = [];
   const seen = new Set();
-  const candidates = [String(track?.baseUrl || '').trim(), String(fallbackUrl || '').trim()];
-  candidates.forEach((raw) => {
+  const candidates = [
+    { url: String(track?.baseUrl || '').trim(), source: 'PLAYER_RESPONSE' },
+    { url: String(fallbackUrl || '').trim(), source: 'PERF_ENTRY' }
+  ];
+  candidates.forEach((candidate) => {
+    const raw = String(candidate?.url || '').trim();
     if (!raw || seen.has(raw)) return;
+    const expire = getTimedtextExpireState(raw);
+    if (candidate?.source === 'PERF_ENTRY' && expire.isExpired) return;
     seen.add(raw);
     urls.push(raw);
   });
@@ -2763,6 +2893,23 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   ytRtStatusText = '加载字幕中...';
   renderRealtimeSubtitleList();
   try {
+    if (isYouTubeAdPlaying()) {
+      ytRtItems = [];
+      ytRtStatusText = '广告播放中，广告结束后自动加载字幕...';
+      ytRtTranscriptLoadedVideoKey = '';
+      ytRtNextLoadAt = Date.now() + YT_RT_AD_RETRY_MS;
+      renderRealtimeSubtitleList();
+      window.setTimeout(() => {
+        loadRealtimeTranscript(false);
+      }, YT_RT_AD_RETRY_MS + 120);
+      return;
+    }
+    if (ytRtStatusText.includes('广告播放中')) {
+      ytRtStatusText = '广告已结束，正在加载字幕...';
+      ytRtNextLoadAt = 0;
+      renderRealtimeSubtitleList();
+    }
+
     const track = await requestCaptionTrackFromBridge(videoKey);
     let fallbackUrl = '';
     if (!track?.baseUrl) {
@@ -2835,6 +2982,17 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
     }
 
     if (status === 'HTML_RESPONSE') {
+      if (isYouTubeAdPlaying()) {
+        ytRtItems = [];
+        ytRtStatusText = '广告阶段字幕不可用，广告结束后自动重试...';
+        ytRtTranscriptLoadedVideoKey = '';
+        ytRtNextLoadAt = Date.now() + YT_RT_AD_RETRY_MS;
+        renderRealtimeSubtitleList();
+        window.setTimeout(() => {
+          loadRealtimeTranscript(false);
+        }, YT_RT_AD_RETRY_MS + 120);
+        return;
+      }
       const htmlReason = String(subtitleBundle?.debug?.htmlReason || '').trim();
       console.warn('[yt-cc] subtitle response is html page', {
         videoKey,
