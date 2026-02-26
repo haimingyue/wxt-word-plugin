@@ -3557,6 +3557,7 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   }
 
   if (ytRtHasFullTimeline && ytRtItems.length) {
+    scheduleBackfillLane(videoKey, 60);
     return;
   }
 
@@ -3659,6 +3660,7 @@ async function tryLoadFullTranscriptOnce(videoKey) {
       if (items.length) {
         await applyLoadedRealtimeItems(videoKey, items);
         ytRtHasFullTimeline = true;
+        scheduleBackfillLane(videoKey, 20);
         return true;
       }
     }
@@ -3667,6 +3669,7 @@ async function tryLoadFullTranscriptOnce(videoKey) {
       if (fallbackItems.length) {
         await applyLoadedRealtimeItems(videoKey, fallbackItems);
         ytRtHasFullTimeline = true;
+        scheduleBackfillLane(videoKey, 20);
         return true;
       }
     }
