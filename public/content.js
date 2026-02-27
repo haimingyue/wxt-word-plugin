@@ -3286,8 +3286,26 @@ function updateRealtimeActiveRow(shouldScroll = false) {
   if (!target) return;
   target.classList.add('is-active');
   if (shouldScroll) {
-    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    scrollActiveRowInList(listEl, target);
   }
+}
+
+function scrollActiveRowInList(listEl, rowEl) {
+  if (!listEl || !rowEl) return;
+  const viewTop = listEl.scrollTop;
+  const viewBottom = viewTop + listEl.clientHeight;
+  const rowTop = rowEl.offsetTop;
+  const rowBottom = rowTop + rowEl.offsetHeight;
+  const safePadding = Math.max(18, Math.round(listEl.clientHeight * 0.12));
+  const isAbove = rowTop < viewTop + safePadding;
+  const isBelow = rowBottom > viewBottom - safePadding;
+  if (!isAbove && !isBelow) return;
+
+  const centeredTop = Math.max(0, rowTop - (listEl.clientHeight - rowEl.offsetHeight) / 2);
+  listEl.scrollTo({
+    top: centeredTop,
+    behavior: 'smooth'
+  });
 }
 
 function updateRealtimeItemTranslation(itemId, translation) {

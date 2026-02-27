@@ -442,8 +442,8 @@ ytd-watch-flexy.yt-rt-vertical-view-active.yt-rt-target-secondary #secondary #yt
   background: rgba(12, 17, 25, 0.92) !important;
 }
 
-ytd-watch-flexy.yt-rt-vertical-view-active.yt-rt-target-full-bleed[full-bleed-player]:not([fullscreen])
-  #full-bleed-container {
+ytd-watch-flexy.yt-rt-vertical-view-active.yt-rt-target-full-bleed #full-bleed-container {
+  position: relative;
   width: calc(100% - var(--yt-rt-panel-width)) !important;
   max-width: calc(100% - var(--yt-rt-panel-width)) !important;
   overflow: visible !important;
@@ -604,6 +604,7 @@ ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translat
   padding: 8px;
   padding-bottom: 20px;
   scroll-behavior: smooth;
+  overscroll-behavior: contain;
   background: rgba(2, 6, 23, 0.35);
 }
 
