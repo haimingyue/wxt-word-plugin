@@ -705,7 +705,12 @@ ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translat
 }
 
 #yt-rt-translate-panel .yt-rt-item__translation.is-empty {
-  display: none;
+  display: block;
+  color: rgba(203, 213, 225, 0.72) !important;
+}
+
+#yt-rt-translate-panel .yt-rt-item__translation.is-pending-active {
+  color: #fde68a !important;
 }
 
 #yt-rt-translate-overlay {

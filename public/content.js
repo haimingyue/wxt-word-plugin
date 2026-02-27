@@ -38,7 +38,7 @@ const YT_RT_TRANSLATE_WINDOW_BEHIND = 2;
 const YT_RT_SEEK_WINDOW_AHEAD = 10;
 const YT_RT_SEEK_WINDOW_BEHIND = 3;
 const YT_RT_SEEK_JUMP_SECONDS = 2;
-const YT_RT_INITIAL_ACTIVE_SKIP_COUNT = 3;
+const YT_RT_INITIAL_ACTIVE_SKIP_COUNT = 0;
 const YT_RT_BUDGET_TOTAL = 300;
 const YT_RT_BUDGET_SEEK_RESERVE = 80;
 const YT_RT_FULL_TRANSCRIPT_RETRY_MS = 5000;
@@ -61,6 +61,17 @@ const YT_RT_BACKFILL_GROUP_MAX_GAP_SECONDS = 3.5;
 const YT_RT_BACKFILL_IDLE_DELAY_MS = 140;
 const YT_RT_BACKFILL_RETRY_COOLDOWN_MS = 1800;
 const YT_RT_BACKFILL_BATCH_TIMEOUT_MS = 9000;
+const YT_RT_BACKFILL_TIMESLICE_INTERVAL_MS = 1000;
+const YT_RT_BACKFILL_TIMESLICE_REFILL_BATCHES = 1;
+const YT_RT_BACKFILL_TIMESLICE_MAX_BATCHES = 2;
+const YT_RT_ACTIVE_WATCHDOG_DELAY_MS = 650;
+const YT_RT_REASON_LOG_DEDUP_MS = 1400;
+const YT_RT_REASON_LOG_MAX = 1200;
+const YT_RT_FLAG_COLD_START_SKIP_COUNT_KEY = 'ytRtColdStartSkipCount';
+const YT_RT_FLAG_FAST_LANE_VARIABLE_BATCH_KEY = 'ytRtFastLaneVariableBatchEnabled';
+const YT_RT_FLAG_BACKFILL_TIMESLICE_KEY = 'ytRtBackfillTimesliceEnabled';
+const YT_RT_FLAG_DEBUG_REASON_CODE_KEY = 'ytRtDebugReasonCodeEnabled';
+const YT_RT_FLAG_RIGHT_PANEL_SHOW_TRANSLATION_KEY = 'ytRtRightPanelShowTranslation';
 /**
  * Message protocol:
  * `YT_SUBTITLE_FETCH_REQUEST`: content -> injected(main world)
@@ -103,6 +114,8 @@ let ytRtInitialActiveSkipRemaining = 0;
 let ytRtBackfillInFlight = false;
 let ytRtBackfillTimer = 0;
 let ytRtBackfillCursor = 0;
+let ytRtBackfillBatchTokens = YT_RT_BACKFILL_TIMESLICE_REFILL_BATCHES;
+let ytRtBackfillTokenRefillAt = Date.now();
 let ytRtCanTranslate = null;
 let ytRtAutoCcTriedVideoKey = '';
 let ytRtLoadingPromise = null;
@@ -132,11 +145,147 @@ const ytRtNextFullTranscriptTryAtByVideo = new Map();
 let ytRtOverlayPos = null;
 let ytRtOverlayDragBound = false;
 let ytRtOverlayPendingItemId = '';
+let ytRtHasDispatchedActiveOnce = false;
+const ytRtSkipReasonLogAt = new Map();
+const ytRtFullTranscriptKickoffByVideo = new Map();
+let ytRtActiveWatchdogTimer = 0;
+let ytRtActiveWatchdogKey = '';
 
 let meaningRequestId = 0;
 let translationRequestId = 0;
 let dictRequestId = 0;
 let parseRequestId = 0;
+
+function getFlagRawValue(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (_) {
+    return null;
+  }
+}
+
+function getFlagBool(key, defaultValue) {
+  const raw = String(getFlagRawValue(key) ?? '').trim().toLowerCase();
+  if (!raw) return Boolean(defaultValue);
+  if (raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes') return true;
+  if (raw === '0' || raw === 'false' || raw === 'off' || raw === 'no') return false;
+  return Boolean(defaultValue);
+}
+
+function getFlagNumber(key, defaultValue, { min = 0, max = 999 } = {}) {
+  const raw = String(getFlagRawValue(key) ?? '').trim();
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return Number(defaultValue);
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function getRealtimeColdStartSkipCount() {
+  return getFlagNumber(YT_RT_FLAG_COLD_START_SKIP_COUNT_KEY, YT_RT_INITIAL_ACTIVE_SKIP_COUNT, {
+    min: 0,
+    max: 10
+  });
+}
+
+function isFastLaneVariableBatchEnabled() {
+  return getFlagBool(YT_RT_FLAG_FAST_LANE_VARIABLE_BATCH_KEY, true);
+}
+
+function isBackfillTimesliceEnabled() {
+  return getFlagBool(YT_RT_FLAG_BACKFILL_TIMESLICE_KEY, true);
+}
+
+function isDebugReasonCodeEnabled() {
+  return getFlagBool(YT_RT_FLAG_DEBUG_REASON_CODE_KEY, false);
+}
+
+function isRightPanelShowTranslationEnabled() {
+  return getFlagBool(YT_RT_FLAG_RIGHT_PANEL_SHOW_TRANSLATION_KEY, true);
+}
+
+function buildReasonEntryKey(entry) {
+  const id = String(entry?.id || '').trim();
+  if (id) return id;
+  const index = Number(entry?.index);
+  if (Number.isInteger(index)) return `idx:${index}`;
+  const source = String(entry?.source || '')
+    .trim()
+    .slice(0, 48);
+  return source ? `src:${source}` : 'unknown';
+}
+
+function reportTranslateSkip(entry, reasonCode, lane = 'unknown', meta = {}) {
+  if (!isDebugReasonCodeEnabled()) return;
+  const reason = String(reasonCode || '').trim();
+  if (!reason) return;
+  const videoId = String(ytRtTranscriptLoadedVideoKey || getCurrentYouTubeVideoKey() || '').trim();
+  const entryKey = buildReasonEntryKey(entry);
+  const dedupeKey = `${videoId}|${lane}|${entryKey}|${reason}`;
+  const now = Date.now();
+  const lastAt = Number(ytRtSkipReasonLogAt.get(dedupeKey) || 0);
+  if (lastAt > 0 && now - lastAt < YT_RT_REASON_LOG_DEDUP_MS) return;
+  ytRtSkipReasonLogAt.set(dedupeKey, now);
+  if (ytRtSkipReasonLogAt.size > YT_RT_REASON_LOG_MAX) {
+    const firstKey = ytRtSkipReasonLogAt.keys().next().value;
+    if (firstKey) ytRtSkipReasonLogAt.delete(firstKey);
+  }
+  console.debug('[yt-rt][skip]', {
+    reasonCode: reason,
+    lane,
+    videoId,
+    entryKey,
+    timestamp: new Date(now).toISOString(),
+    currentTime: Number(getCurrentVideoTimeSeconds() || 0).toFixed(3),
+    meta: meta && typeof meta === 'object' ? meta : {}
+  });
+}
+
+function reportTranslateSkipBatch(entries, reasonCode, lane = 'unknown', meta = {}) {
+  if (!Array.isArray(entries) || !entries.length) return;
+  entries.forEach((entry) => reportTranslateSkip(entry, reasonCode, lane, meta));
+}
+
+function reportTranslateDispatch(lane, sources, meta = {}) {
+  if (!isDebugReasonCodeEnabled()) return;
+  const payload = Array.isArray(sources) ? sources.map((item) => String(item || '').trim()).filter(Boolean) : [];
+  if (!payload.length) return;
+  console.debug('[yt-rt][dispatch]', {
+    lane,
+    videoId: String(ytRtTranscriptLoadedVideoKey || getCurrentYouTubeVideoKey() || '').trim(),
+    count: payload.length,
+    preview: payload.slice(0, 2),
+    timestamp: new Date().toISOString(),
+    currentTime: Number(getCurrentVideoTimeSeconds() || 0).toFixed(3),
+    meta: meta && typeof meta === 'object' ? meta : {}
+  });
+}
+
+function resetBackfillTimesliceBudget() {
+  ytRtBackfillBatchTokens = Math.max(1, Number(YT_RT_BACKFILL_TIMESLICE_REFILL_BATCHES) || 1);
+  ytRtBackfillTokenRefillAt = Date.now();
+}
+
+function refillBackfillTimesliceBudget() {
+  if (!isBackfillTimesliceEnabled()) return;
+  const intervalMs = Math.max(200, Number(YT_RT_BACKFILL_TIMESLICE_INTERVAL_MS) || 1000);
+  const refillBatches = Math.max(1, Number(YT_RT_BACKFILL_TIMESLICE_REFILL_BATCHES) || 1);
+  const maxBatches = Math.max(refillBatches, Number(YT_RT_BACKFILL_TIMESLICE_MAX_BATCHES) || 2);
+  const now = Date.now();
+  const elapsed = now - Number(ytRtBackfillTokenRefillAt || now);
+  if (elapsed < intervalMs) return;
+  const steps = Math.floor(elapsed / intervalMs);
+  ytRtBackfillBatchTokens = Math.min(maxBatches, ytRtBackfillBatchTokens + steps * refillBatches);
+  ytRtBackfillTokenRefillAt = now;
+}
+
+function consumeBackfillTimesliceBatches(maxWanted = 1) {
+  if (!isBackfillTimesliceEnabled()) return Math.max(1, Number(maxWanted) || 1);
+  refillBackfillTimesliceBudget();
+  const want = Math.max(1, Number(maxWanted) || 1);
+  const granted = Math.min(want, Math.max(0, Number(ytRtBackfillBatchTokens) || 0));
+  if (granted <= 0) return 0;
+  ytRtBackfillBatchTokens -= granted;
+  return granted;
+}
 
 function getTtsAccentLabel() {
   return preferredTtsAccent === 'us' ? '口音：美式' : '口音：英式';
@@ -1416,7 +1565,20 @@ function safeSendMessage(message, callback) {
 }
 
 function normalizeExtensionError(err) {
-  const raw = String(err?.message || err || '');
+  let raw = '';
+  if (typeof err === 'string') {
+    raw = err;
+  } else if (err?.message) {
+    raw = String(err.message || '');
+  } else if (err && typeof err === 'object') {
+    try {
+      raw = JSON.stringify(err);
+    } catch (_) {
+      raw = String(err);
+    }
+  } else {
+    raw = String(err || '');
+  }
   if (raw.toLowerCase().includes('extension context invalidated')) {
     return '扩展已更新，请刷新页面';
   }
@@ -1844,8 +2006,13 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtFastLanePendingSeek = false;
     ytRtFastLanePrimaryChunkStart = -1;
     ytRtInitialActiveSkipRemaining = 0;
+    ytRtHasDispatchedActiveOnce = false;
     ytRtBackfillInFlight = false;
     ytRtBackfillCursor = 0;
+    resetBackfillTimesliceBudget();
+    clearTimeout(ytRtActiveWatchdogTimer);
+    ytRtActiveWatchdogTimer = 0;
+    ytRtActiveWatchdogKey = '';
     clearTimeout(ytRtBackfillTimer);
     ytRtBackfillTimer = 0;
     ytRtOverlayPendingItemId = '';
@@ -1855,6 +2022,8 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtChunkInflight.clear();
     ytRtChunkLastRequestAt.clear();
     ytRtFullTranscriptInflightByVideo.clear();
+    ytRtFullTranscriptKickoffByVideo.clear();
+    ytRtSkipReasonLogAt.clear();
     renderRealtimeSubtitleList();
     renderRealtimeSubtitleOverlay(null);
   }
@@ -1994,12 +2163,19 @@ function teardownRealtimeSubtitleObserver() {
   ytRtInitialActiveSkipRemaining = 0;
   ytRtBackfillInFlight = false;
   ytRtBackfillCursor = 0;
+  resetBackfillTimesliceBudget();
+  clearTimeout(ytRtActiveWatchdogTimer);
+  ytRtActiveWatchdogTimer = 0;
+  ytRtActiveWatchdogKey = '';
   ytRtTranslationInflight.clear();
   ytRtBackfillFailedAt.clear();
   ytRtBudgetSourcesByVideo.clear();
   ytRtChunkInflight.clear();
   ytRtChunkLastRequestAt.clear();
   ytRtFullTranscriptInflightByVideo.clear();
+  ytRtFullTranscriptKickoffByVideo.clear();
+  ytRtSkipReasonLogAt.clear();
+  ytRtHasDispatchedActiveOnce = false;
   ytRtNextFullTranscriptTryAtByVideo.clear();
   document
     .querySelector('ytd-watch-flexy')
@@ -2797,9 +2973,11 @@ async function applyLoadedRealtimeItems(videoKey, items) {
   ytRtActiveItemId = '';
   ytRtActiveIndex = -1;
   ytRtLastPlaybackSeconds = -1;
+  ytRtHasDispatchedActiveOnce = false;
+  resetBackfillTimesliceBudget();
   ytRtInitialActiveSkipRemaining = Math.max(
     0,
-    Math.min(Number(YT_RT_INITIAL_ACTIVE_SKIP_COUNT) || 0, items.length)
+    Math.min(getRealtimeColdStartSkipCount(), items.length)
   );
   renderRealtimeSubtitleList();
   syncRealtimeActiveItemByPlayback(true);
@@ -3354,16 +3532,29 @@ function triggerActiveSentenceTranslation(videoKey, index, { isSeek = false } = 
   if (!ytRtEnabled) return;
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!Number.isInteger(index) || index < 0 || index >= ytRtItems.length) return;
+  const currentEntry = ytRtItems[index] || null;
+  if (!ytRtHasDispatchedActiveOnce) {
+    ytRtHasDispatchedActiveOnce = true;
+    scheduleRealtimeTranslation(videoKey, index, { isSeek });
+    scheduleActiveTranslationWatchdog(videoKey, index);
+    return;
+  }
   if (!isSeek && ytRtInitialActiveSkipRemaining > 0) {
     ytRtInitialActiveSkipRemaining -= 1;
-    const ahead = Math.max(1, Number(YT_RT_INITIAL_ACTIVE_SKIP_COUNT) || 1);
+    reportTranslateSkip(currentEntry, 'SKIP_COLD_START', 'fast', {
+      remaining: ytRtInitialActiveSkipRemaining,
+      skipCount: getRealtimeColdStartSkipCount()
+    });
+    const ahead = Math.max(1, getRealtimeColdStartSkipCount() || 1);
     const prefetchIndex = Math.min(ytRtItems.length - 1, index + ahead);
     if (prefetchIndex > index) {
       scheduleRealtimeTranslation(videoKey, prefetchIndex, { isSeek: false });
     }
     return;
   }
+  ytRtHasDispatchedActiveOnce = true;
   scheduleRealtimeTranslation(videoKey, index, { isSeek });
+  scheduleActiveTranslationWatchdog(videoKey, index);
 }
 
 function updateRealtimeActiveRow(shouldScroll = false) {
@@ -3378,6 +3569,16 @@ function updateRealtimeActiveRow(shouldScroll = false) {
   const target = listEl.querySelector(selector);
   if (!target) return;
   target.classList.add('is-active');
+  if (isRightPanelShowTranslationEnabled()) {
+    const pendingRows = listEl.querySelectorAll('.yt-rt-item__translation.is-empty');
+    pendingRows.forEach((node) => {
+      const parent = node.closest('[data-yt-rt-item-id]');
+      const itemId = String(parent?.dataset?.ytRtItemId || '');
+      const isActivePending = Boolean(itemId && itemId === ytRtActiveItemId);
+      node.textContent = isActivePending ? '正在翻译该句' : '翻译中…';
+      node.classList.toggle('is-pending-active', isActivePending);
+    });
+  }
   if (shouldScroll) {
     scrollActiveRowInList(listEl, target);
   }
@@ -3402,13 +3603,17 @@ function scrollActiveRowInList(listEl, rowEl) {
 }
 
 function updateRealtimeItemTranslation(itemId, translation) {
+  if (!isRightPanelShowTranslationEnabled()) return;
   const listEl = document.querySelector(`#${YT_RT_PANEL_ID} [data-yt-rt-list]`);
   if (!listEl) return;
   const selector = `[data-yt-rt-item-id="${escapeAttr(itemId)}"] .yt-rt-item__translation`;
   const rowTranslation = listEl.querySelector(selector);
   if (!rowTranslation) return;
-  rowTranslation.textContent = translation || '';
-  rowTranslation.classList.toggle('is-empty', !translation);
+  const cleanTranslation = String(translation || '').trim();
+  const placeholder = itemId === ytRtActiveItemId ? '正在翻译该句' : '翻译中…';
+  rowTranslation.textContent = cleanTranslation || placeholder;
+  rowTranslation.classList.toggle('is-empty', !cleanTranslation);
+  rowTranslation.classList.toggle('is-pending-active', !cleanTranslation && itemId === ytRtActiveItemId);
 }
 
 function scheduleRealtimeTranslation(videoKey, centerIndex, { isSeek = false } = {}) {
@@ -3421,7 +3626,46 @@ function scheduleRealtimeTranslation(videoKey, centerIndex, { isSeek = false } =
   ytRtFastLaneTargets = buildFastLaneChunkStarts(centerIndex, { isSeek });
   ytRtFastLanePendingSeek = Boolean(isSeek);
   ytRtFastLanePrimaryChunkStart = ytRtFastLaneTargets.length ? ytRtFastLaneTargets[0] : -1;
-  runFastLane();
+  runFastLane().catch((err) => {
+    reportTranslateSkip(ytRtItems[centerIndex] || null, 'SKIP_CHUNK_NOT_READY', 'fast', {
+      stage: 'run_fast_lane_exception',
+      message: normalizeExtensionError(err)
+    });
+  });
+}
+
+function scheduleActiveTranslationWatchdog(videoKey, index, delayMs = YT_RT_ACTIVE_WATCHDOG_DELAY_MS) {
+  if (!ytRtEnabled) return;
+  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
+  if (!Number.isInteger(index) || index < 0 || index >= ytRtItems.length) return;
+  const item = ytRtItems[index];
+  if (!item) return;
+  const itemId = String(item.id || '').trim();
+  if (!itemId) return;
+  const watchdogKey = `${videoKey}:${itemId}:${index}`;
+  ytRtActiveWatchdogKey = watchdogKey;
+  clearTimeout(ytRtActiveWatchdogTimer);
+  ytRtActiveWatchdogTimer = window.setTimeout(() => {
+    if (ytRtActiveWatchdogKey !== watchdogKey) return;
+    if (!ytRtEnabled) return;
+    if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
+    if (index !== ytRtActiveIndex) return;
+    const latest = ytRtItems[index];
+    if (!latest || String(latest.id || '') !== itemId) return;
+    const source = String(latest.source || '').trim();
+    if (!source) return;
+    if (String(latest.translation || '').trim()) return;
+    if (ytRtTranslationInflight.has(source)) return;
+    reportTranslateSkip(latest, 'SKIP_CHUNK_NOT_READY', 'fast', {
+      stage: 'watchdog_force_single_request'
+    });
+    translateTimelineItemByIndex(videoKey, index, {
+      timeoutMs: YT_RT_FAST_TIMEOUT_MS,
+      markBackfillFailure: true,
+      budgetMode: 'seek',
+      forceSend: true
+    }).catch(() => {});
+  }, Math.max(200, Number(delayMs) || YT_RT_ACTIVE_WATCHDOG_DELAY_MS));
 }
 
 function scheduleBackfillLane(videoKey, delayMs = YT_RT_BACKFILL_IDLE_DELAY_MS) {
@@ -3451,11 +3695,18 @@ async function runFastLane() {
         if (epoch !== ytRtFastLaneEpoch) {
           break;
         }
-        await translateTimelineChunk(videoKey, chunkStart, {
-          isSeek,
-          allowSingleFallback: chunkStart === primaryChunkStart,
-          activeIndex: ytRtActiveIndex
-        });
+        try {
+          await translateTimelineChunk(videoKey, chunkStart, {
+            isSeek,
+            allowSingleFallback: chunkStart === primaryChunkStart,
+            activeIndex: ytRtActiveIndex
+          });
+        } catch (err) {
+          reportTranslateSkip({ id: `chunk:${chunkStart}` }, 'SKIP_CHUNK_NOT_READY', 'fast', {
+            stage: 'chunk_exception',
+            message: normalizeExtensionError(err)
+          });
+        }
       }
     }
   } finally {
@@ -3497,8 +3748,20 @@ async function translateTimelineChunk(
   chunkStart,
   { isSeek = false, allowSingleFallback = false, activeIndex = -1 } = {}
 ) {
-  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return false;
-  if (!Number.isInteger(chunkStart) || chunkStart < 0 || chunkStart >= ytRtItems.length) return false;
+  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) {
+    reportTranslateSkip({ id: `chunk:${chunkStart}` }, 'SKIP_CHUNK_NOT_READY', 'fast', {
+      stage: 'video_mismatch',
+      chunkStart
+    });
+    return false;
+  }
+  if (!Number.isInteger(chunkStart) || chunkStart < 0 || chunkStart >= ytRtItems.length) {
+    reportTranslateSkip({ id: `chunk:${chunkStart}` }, 'SKIP_CHUNK_NOT_READY', 'fast', {
+      stage: 'invalid_chunk',
+      chunkStart
+    });
+    return false;
+  }
 
   const chunkKey = `${videoKey}:${chunkStart}`;
   const existing = ytRtChunkInflight.get(chunkKey);
@@ -3508,25 +3771,70 @@ async function translateTimelineChunk(
   }
 
   const now = Date.now();
+  const size = Math.max(1, Number(YT_RT_ACTIVE_GROUP_MAX_SEGMENTS) || 1);
+  const chunkEnd = Math.min(ytRtItems.length - 1, chunkStart + size - 1);
+  const hasUrgentActive =
+    Number.isInteger(activeIndex) &&
+    activeIndex >= chunkStart &&
+    activeIndex <= chunkEnd &&
+    !String(ytRtItems[activeIndex]?.translation || '').trim();
   if (!isSeek) {
     const lastAt = Number(ytRtChunkLastRequestAt.get(chunkKey) || 0);
-    if (lastAt > 0 && now - lastAt < YT_RT_CHUNK_RETRY_COOLDOWN_MS) {
+    if (!hasUrgentActive && lastAt > 0 && now - lastAt < YT_RT_CHUNK_RETRY_COOLDOWN_MS) {
+      reportTranslateSkip({ id: `chunk:${chunkStart}` }, 'SKIP_CHUNK_NOT_READY', 'fast', {
+        stage: 'chunk_retry_cooldown',
+        cooldownMs: YT_RT_CHUNK_RETRY_COOLDOWN_MS
+      });
       return false;
     }
   }
-  const size = Math.max(1, Number(YT_RT_ACTIVE_GROUP_MAX_SEGMENTS) || 1);
-  const chunkEnd = Math.min(ytRtItems.length - 1, chunkStart + size - 1);
   const budgetMode = isSeek ? 'seek' : 'normal';
-  const entries = collectChunkPendingEntries(videoKey, chunkStart, chunkEnd, { budgetMode, activeIndex });
+  const entries = collectChunkPendingEntries(videoKey, chunkStart, chunkEnd, {
+    budgetMode,
+    activeIndex,
+    lane: 'fast'
+  });
   if (!entries.length) return true;
 
   ytRtChunkLastRequestAt.set(chunkKey, now);
-  const promise = translateEntryGroup(videoKey, entries, {
-    timeoutMs: isSeek ? YT_RT_FAST_TIMEOUT_MS : YT_RT_ACTIVE_GROUP_TIMEOUT_MS,
-    allowSingleFallback: true,
-    activeIndex,
-    allowBatchFallback: true
-  }).finally(() => {
+  const promise = (async () => {
+    const timeoutMs = isSeek ? YT_RT_FAST_TIMEOUT_MS : YT_RT_ACTIVE_GROUP_TIMEOUT_MS;
+    if (isFastLaneVariableBatchEnabled()) {
+      const activeEntry = entries.find((entry) => entry?.index === activeIndex) || null;
+      if (activeEntry) {
+        await translateEntryGroup(videoKey, [activeEntry], {
+          timeoutMs,
+          allowSingleFallback: true,
+          activeIndex,
+          allowBatchFallback: true,
+          lane: 'fast',
+          batchMode: 'adaptive',
+          adaptiveBatchSize: 1
+        });
+      }
+      const remainingEntries = activeEntry
+        ? entries.filter((entry) => entry?.id !== activeEntry.id)
+        : entries;
+      if (!remainingEntries.length) return true;
+      return translateEntryGroup(videoKey, remainingEntries, {
+        timeoutMs,
+        allowSingleFallback: true,
+        activeIndex,
+        allowBatchFallback: true,
+        lane: 'fast',
+        batchMode: 'adaptive',
+        adaptiveBatchSize: YT_RT_TRANSLATE_RPC_FIXED_SIZE
+      });
+    }
+    return translateEntryGroup(videoKey, entries, {
+      timeoutMs,
+      allowSingleFallback: true,
+      activeIndex,
+      allowBatchFallback: true,
+      lane: 'fast',
+      batchMode: 'fixed'
+    });
+  })().finally(() => {
     if (ytRtChunkInflight.get(chunkKey) === promise) {
       ytRtChunkInflight.delete(chunkKey);
     }
@@ -3540,31 +3848,42 @@ async function runBackfillLane(videoKey) {
   if (!ytRtHasFullTimeline || !ytRtItems.length) return;
   if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (isCurrentVideoPaused()) return;
-  if (ytRtFastLaneInFlight) {
-    scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
-    return;
+  const fixedBatchSize = Math.max(1, Number(YT_RT_TRANSLATE_RPC_FIXED_SIZE) || 1);
+  let targetLimit = Math.max(1, Number(YT_RT_BACKFILL_BATCH_TRANSLATE_SIZE) || fixedBatchSize);
+  if (isBackfillTimesliceEnabled()) {
+    const maxWantedBatches = ytRtFastLaneInFlight ? 1 : 2;
+    const grantedBatches = consumeBackfillTimesliceBatches(maxWantedBatches);
+    if (grantedBatches <= 0) {
+      reportTranslateSkip({ id: 'backfill-timeslice' }, 'SKIP_RATE_LIMIT', 'backfill', {
+        stage: 'timeslice_budget_empty'
+      });
+      scheduleBackfillLane(
+        videoKey,
+        Math.max(YT_RT_BACKFILL_IDLE_DELAY_MS, Math.floor(YT_RT_BACKFILL_TIMESLICE_INTERVAL_MS / 2))
+      );
+      return;
+    }
+    targetLimit = grantedBatches * fixedBatchSize;
   }
 
-  const targets = collectBackfillTargets(YT_RT_BACKFILL_BATCH_TRANSLATE_SIZE);
+  const targets = collectBackfillTargets(targetLimit);
   if (!targets.length) return;
 
   ytRtBackfillInFlight = true;
   try {
-    const pendingEntries = collectBackfillPendingEntries(targets);
+    const pendingEntries = collectBackfillPendingEntries(targets).slice(0, targetLimit);
     if (!pendingEntries.length) return;
     const groups = buildBackfillGroups(pendingEntries);
     if (!groups.length) return;
 
     for (const group of groups) {
       if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
-      if (ytRtFastLaneInFlight) {
-        scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
-        return;
-      }
       await translateEntryGroup(videoKey, group, {
         timeoutMs: YT_RT_BACKFILL_BATCH_TIMEOUT_MS,
         allowSingleFallback: false,
-        allowBatchFallback: true
+        allowBatchFallback: true,
+        lane: 'backfill',
+        batchMode: 'fixed'
       });
     }
   } finally {
@@ -3578,7 +3897,13 @@ async function runBackfillLane(videoKey) {
 function collectWindowPendingEntries(
   videoKey,
   centerIndex,
-  { ahead = YT_RT_TRANSLATE_WINDOW_AHEAD, behind = YT_RT_TRANSLATE_WINDOW_BEHIND, budgetMode = 'normal', limit = 0 } = {}
+  {
+    ahead = YT_RT_TRANSLATE_WINDOW_AHEAD,
+    behind = YT_RT_TRANSLATE_WINDOW_BEHIND,
+    budgetMode = 'normal',
+    limit = 0,
+    lane = 'fast'
+  } = {}
 ) {
   if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return [];
   const min = Math.max(0, centerIndex - Math.max(0, Number(behind) || 0));
@@ -3586,6 +3911,7 @@ function collectWindowPendingEntries(
   const maxCount = Math.max(0, Number(limit) || 0);
   const now = Date.now();
   const entries = [];
+  const seenSources = new Set();
   const candidates = [centerIndex];
   const maxDistance = Math.max(centerIndex - min, max - centerIndex);
   for (let distance = 1; distance <= maxDistance; distance += 1) {
@@ -3597,9 +3923,24 @@ function collectWindowPendingEntries(
 
   for (const index of candidates) {
     const item = ytRtItems[index];
-    if (!item || item.translation) continue;
+    if (!item) continue;
+    if (item.translation) {
+      reportTranslateSkip(item, 'SKIP_DUPLICATE', lane, {
+        stage: 'already_translated',
+        index
+      });
+      continue;
+    }
     const source = String(item.source || '').trim();
     if (!source) continue;
+    if (seenSources.has(source)) {
+      reportTranslateSkip(item, 'SKIP_DUPLICATE', lane, {
+        stage: 'window_collect',
+        index
+      });
+      continue;
+    }
+    seenSources.add(source);
     if (ytRtTranslationCache.has(source)) {
       const cached = ytRtTranslationCache.get(source);
       item.translation = cached;
@@ -3607,14 +3948,28 @@ function collectWindowPendingEntries(
       if (item.id === ytRtActiveItemId) {
         renderRealtimeSubtitleOverlay(item);
       }
+      reportTranslateSkip(item, 'SKIP_CACHE_HIT', lane, { index });
       continue;
     }
-    if (ytRtTranslationInflight.has(source)) continue;
+    if (ytRtTranslationInflight.has(source)) {
+      reportTranslateSkip(item, 'SKIP_IN_FLIGHT', lane, { index });
+      continue;
+    }
     const failedAt = Number(ytRtBackfillFailedAt.get(item.id) || 0);
     if (index !== centerIndex && failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) {
+      reportTranslateSkip(item, 'SKIP_RATE_LIMIT', lane, {
+        index,
+        stage: 'retry_cooldown'
+      });
       continue;
     }
-    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) continue;
+    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) {
+      reportTranslateSkip(item, 'SKIP_RATE_LIMIT', lane, {
+        index,
+        stage: 'budget'
+      });
+      continue;
+    }
     entries.push({
       index,
       id: item.id,
@@ -3633,16 +3988,32 @@ function collectChunkPendingEntries(
   videoKey,
   chunkStart,
   chunkEnd,
-  { budgetMode = 'normal', activeIndex = -1 } = {}
+  { budgetMode = 'normal', activeIndex = -1, lane = 'fast' } = {}
 ) {
   if (!Number.isInteger(chunkStart) || !Number.isInteger(chunkEnd) || chunkStart > chunkEnd) return [];
   const now = Date.now();
   const entries = [];
+  const seenSources = new Set();
   for (let index = chunkStart; index <= chunkEnd; index += 1) {
     const item = ytRtItems[index];
-    if (!item || item.translation) continue;
+    if (!item) continue;
+    if (item.translation) {
+      reportTranslateSkip(item, 'SKIP_DUPLICATE', lane, {
+        stage: 'already_translated',
+        index
+      });
+      continue;
+    }
     const source = String(item.source || '').trim();
     if (!source) continue;
+    if (seenSources.has(source)) {
+      reportTranslateSkip(item, 'SKIP_DUPLICATE', lane, {
+        stage: 'chunk_collect',
+        index
+      });
+      continue;
+    }
+    seenSources.add(source);
     if (ytRtTranslationCache.has(source)) {
       const cached = ytRtTranslationCache.get(source);
       item.translation = cached;
@@ -3650,14 +4021,28 @@ function collectChunkPendingEntries(
       if (item.id === ytRtActiveItemId) {
         renderRealtimeSubtitleOverlay(item);
       }
+      reportTranslateSkip(item, 'SKIP_CACHE_HIT', lane, { index });
       continue;
     }
-    if (ytRtTranslationInflight.has(source)) continue;
+    if (ytRtTranslationInflight.has(source)) {
+      reportTranslateSkip(item, 'SKIP_IN_FLIGHT', lane, { index });
+      continue;
+    }
     const failedAt = Number(ytRtBackfillFailedAt.get(item.id) || 0);
     if (index !== activeIndex && failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) {
+      reportTranslateSkip(item, 'SKIP_RATE_LIMIT', lane, {
+        index,
+        stage: 'retry_cooldown'
+      });
       continue;
     }
-    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) continue;
+    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) {
+      reportTranslateSkip(item, 'SKIP_RATE_LIMIT', lane, {
+        index,
+        stage: 'budget'
+      });
+      continue;
+    }
     entries.push({
       index,
       id: item.id,
@@ -3732,18 +4117,37 @@ async function translateEntryGroup(
     timeoutMs = YT_RT_BACKFILL_BATCH_TIMEOUT_MS,
     allowSingleFallback = false,
     activeIndex = -1,
-    allowBatchFallback = false
+    allowBatchFallback = false,
+    lane = 'backfill',
+    batchMode = 'fixed',
+    adaptiveBatchSize = YT_RT_TRANSLATE_RPC_FIXED_SIZE
   } = {}
 ) {
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return false;
   if (!Array.isArray(entries) || !entries.length) return false;
+
+  const dedupedEntries = [];
+  const seenSources = new Set();
+  entries.forEach((entry) => {
+    const source = String(entry?.source || '').trim();
+    if (!source) return;
+    if (seenSources.has(source)) {
+      reportTranslateSkip(entry, 'SKIP_DUPLICATE', lane, {
+        stage: 'translate_group_dedupe'
+      });
+      return;
+    }
+    seenSources.add(source);
+    dedupedEntries.push(entry);
+  });
+  if (!dedupedEntries.length) return true;
 
   let resolveInflight = null;
   const inflightMarker = new Promise((resolve) => {
     resolveInflight = resolve;
   });
   const inflightSources = new Set();
-  for (const entry of entries) {
+  for (const entry of dedupedEntries) {
     if (!entry?.source || inflightSources.has(entry.source)) continue;
     ytRtTranslationInflight.set(entry.source, inflightMarker);
     inflightSources.add(entry.source);
@@ -3751,18 +4155,65 @@ async function translateEntryGroup(
 
   try {
     const fixedSize = Math.max(1, Number(YT_RT_TRANSLATE_RPC_FIXED_SIZE) || 1);
-    const sortedEntries = [...entries].sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0));
+    const sortedEntries = [...dedupedEntries].sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0));
+    const effectiveMode = String(batchMode || '').toLowerCase() === 'adaptive' ? 'adaptive' : 'fixed';
     let allSucceeded = true;
+
+    if (effectiveMode === 'adaptive') {
+      const maxAdaptiveSize = Math.min(5, Math.max(1, Number(adaptiveBatchSize) || fixedSize));
+      for (let start = 0; start < sortedEntries.length; start += maxAdaptiveSize) {
+        const chunkEntries = sortedEntries.slice(start, start + maxAdaptiveSize);
+        const sources = chunkEntries
+          .map((entry) => String(entry?.source || '').trim())
+          .filter(Boolean);
+        if (!sources.length) {
+          reportTranslateSkipBatch(chunkEntries, 'SKIP_NOT_ENOUGH_TO_BUILD_PAYLOAD', lane, {
+            stage: 'adaptive_empty_sources'
+          });
+          markEntriesFailed(chunkEntries);
+          allSucceeded = false;
+          continue;
+        }
+
+        reportTranslateDispatch(lane, sources, {
+          mode: 'adaptive',
+          timeoutMs,
+          groupSize: chunkEntries.length
+        });
+        let translations = await requestRealtimeGroupedTranslationWithTimeout(sources, timeoutMs);
+        if (allowBatchFallback && translations.length !== sources.length) {
+          translations = await requestRealtimeBatchTranslationWithTimeout(sources, timeoutMs);
+        }
+        if (translations.length === sources.length) {
+          applyBackfillTranslations(videoKey, chunkEntries, translations);
+          continue;
+        }
+
+        markEntriesFailed(chunkEntries);
+        allSucceeded = false;
+      }
+      return allSucceeded;
+    }
 
     for (let start = 0; start < sortedEntries.length; start += fixedSize) {
       const chunkEntries = sortedEntries.slice(start, start + fixedSize);
       const { sources, targetCount } = buildFixedTranslatePayload(chunkEntries, fixedSize);
       if (!targetCount || sources.length !== fixedSize) {
+        reportTranslateSkipBatch(chunkEntries, 'SKIP_NOT_ENOUGH_TO_BUILD_PAYLOAD', lane, {
+          stage: 'fixed_build_payload',
+          fixedSize
+        });
         markEntriesFailed(chunkEntries);
         allSucceeded = false;
         continue;
       }
 
+      reportTranslateDispatch(lane, sources, {
+        mode: 'fixed',
+        timeoutMs,
+        fixedSize,
+        targetCount
+      });
       let translations = await requestRealtimeGroupedTranslationWithTimeout(sources, timeoutMs);
       if (allowBatchFallback && translations.length !== fixedSize) {
         translations = await requestRealtimeBatchTranslationWithTimeout(sources, timeoutMs);
@@ -3790,20 +4241,46 @@ async function translateEntryGroup(
 function collectBackfillPendingEntries(targets) {
   const now = Date.now();
   const entries = [];
+  const seenSources = new Set();
   for (const index of targets) {
     const item = ytRtItems[index];
-    if (!item || item.translation) continue;
+    if (!item) continue;
+    if (item.translation) {
+      reportTranslateSkip(item, 'SKIP_DUPLICATE', 'backfill', {
+        stage: 'already_translated',
+        index
+      });
+      continue;
+    }
     const source = String(item.source || '').trim();
     if (!source) continue;
+    if (seenSources.has(source)) {
+      reportTranslateSkip(item, 'SKIP_DUPLICATE', 'backfill', {
+        stage: 'backfill_collect',
+        index
+      });
+      continue;
+    }
+    seenSources.add(source);
     if (ytRtTranslationCache.has(source)) {
       const cached = ytRtTranslationCache.get(source);
       item.translation = cached;
       updateRealtimeItemTranslation(item.id, cached);
+      reportTranslateSkip(item, 'SKIP_CACHE_HIT', 'backfill', { index });
       continue;
     }
-    if (ytRtTranslationInflight.has(source)) continue;
+    if (ytRtTranslationInflight.has(source)) {
+      reportTranslateSkip(item, 'SKIP_IN_FLIGHT', 'backfill', { index });
+      continue;
+    }
     const failedAt = Number(ytRtBackfillFailedAt.get(item.id) || 0);
-    if (failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) continue;
+    if (failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) {
+      reportTranslateSkip(item, 'SKIP_RATE_LIMIT', 'backfill', {
+        index,
+        stage: 'retry_cooldown'
+      });
+      continue;
+    }
     entries.push({
       index,
       id: item.id,
@@ -3954,7 +4431,7 @@ function canConsumeTranslateBudget(videoKey, source, mode = 'normal') {
 async function translateTimelineItemByIndex(
   videoKey,
   index,
-  { timeoutMs = 2400, markBackfillFailure = false, budgetMode = 'normal' } = {}
+  { timeoutMs = 2400, markBackfillFailure = false, budgetMode = 'normal', forceSend = false } = {}
 ) {
   const item = ytRtItems[index];
   if (!item) return false;
@@ -3976,20 +4453,35 @@ async function translateTimelineItemByIndex(
 
   let inflight = ytRtTranslationInflight.get(source);
   if (!inflight) {
-    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) {
+    if (!forceSend && !canConsumeTranslateBudget(videoKey, source, budgetMode)) {
       return false;
     }
+    if (forceSend) {
+      const budgetSet = getTranslateBudgetSet(videoKey);
+      budgetSet?.add(source);
+    }
     inflight = (async () => {
-      const fixedSize = Math.max(1, Number(YT_RT_TRANSLATE_RPC_FIXED_SIZE) || 1);
-      const payload = buildFixedTranslatePayload([{ index, source }], fixedSize);
-      if (!payload.targetCount || payload.sources.length !== fixedSize) {
+      const requestSources = isFastLaneVariableBatchEnabled()
+        ? [source]
+        : buildFixedTranslatePayload([{ index, source }], Math.max(1, Number(YT_RT_TRANSLATE_RPC_FIXED_SIZE) || 1))
+            .sources;
+      if (!requestSources.length) {
+        reportTranslateSkip(item, 'SKIP_NOT_ENOUGH_TO_BUILD_PAYLOAD', 'fast', {
+          stage: 'single_item_build_payload'
+        });
         return '';
       }
-      let translations = await requestRealtimeGroupedTranslationWithTimeout(payload.sources, timeoutMs);
-      if (translations.length !== fixedSize) {
-        translations = await requestRealtimeBatchTranslationWithTimeout(payload.sources, timeoutMs);
+      reportTranslateDispatch('fast', requestSources, {
+        mode: forceSend ? 'watchdog_single' : 'single',
+        timeoutMs,
+        forceSend: Boolean(forceSend)
+      });
+      let translations = await requestRealtimeGroupedTranslationWithTimeout(requestSources, timeoutMs);
+      if (translations.length !== requestSources.length) {
+        translations = await requestRealtimeBatchTranslationWithTimeout(requestSources, timeoutMs);
       }
-      const text = translations.length === fixedSize ? String(translations[0] || '').trim() : '';
+      const text =
+        translations.length === requestSources.length ? String(translations[0] || '').trim() : '';
       if (text) {
         ytRtTranslationCache.set(source, text);
         if (ytRtTranslationCache.size > 1200) {
@@ -4118,6 +4610,42 @@ function resolveFullTranscriptRetryMs(status) {
   return YT_RT_FULL_TRANSCRIPT_RETRY_MS;
 }
 
+function kickoffFullTranscriptLoad(videoKey, { allowBridgeFallback = false } = {}) {
+  const key = String(videoKey || '').trim();
+  if (!key) return;
+  const now = Date.now();
+  const nextTryAt = Number(ytRtNextFullTranscriptTryAtByVideo.get(key) || 0);
+  if (now < nextTryAt) {
+    return;
+  }
+  ytRtFullTranscriptTriedVideoKey = key;
+  ytRtNextFullTranscriptTryAtByVideo.set(key, now + YT_RT_FULL_TRANSCRIPT_RETRY_MS);
+  if (!ytRtItems.length) {
+    ytRtStatusText = 'CC 已开启，正在加载全量字幕...';
+    renderRealtimeSubtitleList();
+  }
+
+  const task = tryLoadFullTranscriptOnce(key, { allowBridgeFallback: Boolean(allowBridgeFallback) });
+  const attached = ytRtFullTranscriptKickoffByVideo.get(key);
+  if (attached === task) return;
+  ytRtFullTranscriptKickoffByVideo.set(key, task);
+  task
+    .then((fullLoadResult) => {
+      const result = fullLoadResult || { loaded: false, status: 'FAILED' };
+      if (result.loaded) {
+        ytRtNextFullTranscriptTryAtByVideo.delete(key);
+        return;
+      }
+      ytRtNextFullTranscriptTryAtByVideo.set(key, Date.now() + resolveFullTranscriptRetryMs(result.status));
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (ytRtFullTranscriptKickoffByVideo.get(key) === task) {
+        ytRtFullTranscriptKickoffByVideo.delete(key);
+      }
+    });
+}
+
 async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   const videoKey = getCurrentYouTubeVideoKey();
   if (!videoKey) return;
@@ -4125,6 +4653,8 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
     ytRtLastCaption = '';
     ytRtFullTranscriptTriedVideoKey = '';
     ytRtHasFullTimeline = false;
+    ytRtHasDispatchedActiveOnce = false;
+    ytRtInitialActiveSkipRemaining = getRealtimeColdStartSkipCount();
   }
   if (isYouTubeAdPlaying()) {
     ytRtStatusText = '广告播放中，广告结束后自动读取字幕...';
@@ -4135,25 +4665,9 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
   await ensureRealtimeTranslationCapability();
 
   if (isYouTubeCcEnabled() && !ytRtHasFullTimeline) {
-    const now = Date.now();
-    const nextTryAt = Number(ytRtNextFullTranscriptTryAtByVideo.get(videoKey) || 0);
-    if (now >= nextTryAt) {
-      ytRtFullTranscriptTriedVideoKey = videoKey;
-      ytRtNextFullTranscriptTryAtByVideo.set(videoKey, now + YT_RT_FULL_TRANSCRIPT_RETRY_MS);
-      ytRtStatusText = 'CC 已开启，正在加载全量字幕...';
-      renderRealtimeSubtitleList();
-      const fullLoadResult = await tryLoadFullTranscriptOnce(videoKey, {
-        allowBridgeFallback: Boolean(forceReload)
-      });
-      if (fullLoadResult.loaded) {
-        ytRtNextFullTranscriptTryAtByVideo.delete(videoKey);
-        return;
-      }
-      ytRtNextFullTranscriptTryAtByVideo.set(
-        videoKey,
-        now + resolveFullTranscriptRetryMs(fullLoadResult.status)
-      );
-    }
+    kickoffFullTranscriptLoad(videoKey, {
+      allowBridgeFallback: Boolean(forceReload)
+    });
   }
 
   if (ytRtHasFullTimeline && ytRtItems.length) {
@@ -4561,6 +5075,17 @@ function pushRealtimeSourceOnlyItem(source, videoTimeSeconds = -1) {
   ytRtActiveItemId = ytRtItems[ytRtItems.length - 1]?.id || '';
   renderRealtimeSubtitleList();
   syncRealtimeActiveItemByPlayback(false);
+  if (ytRtActiveIndex < 0 && ytRtItems.length) {
+    const fallbackIndex = ytRtItems.length - 1;
+    ytRtActiveIndex = fallbackIndex;
+    ytRtActiveItemId = ytRtItems[fallbackIndex]?.id || '';
+    renderRealtimeSubtitleOverlay(ytRtItems[fallbackIndex] || null);
+    updateRealtimeActiveRow(false);
+    const videoKey = String(ytRtTranscriptLoadedVideoKey || getCurrentYouTubeVideoKey() || '').trim();
+    if (videoKey) {
+      triggerActiveSentenceTranslation(videoKey, fallbackIndex, { isSeek: false });
+    }
+  }
 }
 
 function renderRealtimeSubtitleOverlay(item) {
@@ -4603,6 +5128,7 @@ function renderRealtimeSubtitleList() {
     return;
   }
   const items = ytRtItems.slice();
+  const showTranslation = isRightPanelShowTranslationEnabled();
   items.forEach((item) => {
     const row = document.createElement('article');
     row.className = 'yt-rt-item';
@@ -4645,6 +5171,21 @@ function renderRealtimeSubtitleList() {
 
     row.appendChild(playBtn);
     row.appendChild(source);
+    if (showTranslation) {
+      const translation = document.createElement('div');
+      const translated = String(item.translation || '').trim();
+      translation.className = 'yt-rt-item__translation';
+      if (translated) {
+        translation.textContent = translated;
+      } else {
+        translation.textContent = item.id === ytRtActiveItemId ? '正在翻译该句' : '翻译中…';
+        translation.classList.add('is-empty');
+        if (item.id === ytRtActiveItemId) {
+          translation.classList.add('is-pending-active');
+        }
+      }
+      row.appendChild(translation);
+    }
     listEl.appendChild(row);
   });
 }
