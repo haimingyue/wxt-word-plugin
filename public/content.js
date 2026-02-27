@@ -1674,6 +1674,35 @@ function scheduleRealtimePanelLayoutSync(delayMs = 0) {
   }, Math.max(0, Number(delayMs) || 0));
 }
 
+function triggerYouTubeLayoutReflow() {
+  const watchFlexy = document.querySelector('ytd-watch-flexy');
+  try {
+    watchFlexy?.dispatchEvent?.(new Event('iron-resize', { bubbles: true, composed: true }));
+  } catch (_) {}
+  try {
+    window.dispatchEvent(new Event('resize'));
+  } catch (_) {}
+}
+
+function forceRealtimePanelDockedLayout() {
+  triggerYouTubeLayoutReflow();
+  syncRealtimePanelLayout();
+  scheduleRealtimePanelLayoutSyncBurst([0, 80, 180, 320, 520, 900]);
+  window.setTimeout(() => triggerYouTubeLayoutReflow(), 120);
+  window.setTimeout(() => triggerYouTubeLayoutReflow(), 420);
+}
+
+function clearRealtimeWatchLayoutClasses(watchFlexy) {
+  watchFlexy?.classList?.remove(
+    YT_RT_WATCH_ACTIVE_CLASS,
+    YT_RT_TARGET_FULL_CLASS,
+    YT_RT_TARGET_PLAYER_FULL_CLASS,
+    YT_RT_TARGET_PLAYER_CONTAINER_CLASS,
+    YT_RT_TARGET_SECONDARY_CLASS,
+    YT_RT_HIDE_NATIVE_CAPTIONS_CLASS
+  );
+}
+
 function scheduleRealtimePanelLayoutSyncBurst(delays = [0, 120, 320, 720]) {
   for (const timer of ytRtLayoutBurstTimers) {
     clearTimeout(timer);
@@ -1837,8 +1866,11 @@ function maybeSetupRealtimeSubtitleObserver() {
 
 function syncRealtimePanelLayout() {
   const panel = document.getElementById(YT_RT_PANEL_ID);
-  if (!panel) return;
   const watchFlexy = document.querySelector('ytd-watch-flexy');
+  if (!panel) {
+    clearRealtimeWatchLayoutClasses(watchFlexy);
+    return;
+  }
   watchFlexy?.classList?.remove(
     YT_RT_WATCH_ACTIVE_CLASS,
     YT_RT_TARGET_FULL_CLASS,
@@ -4280,6 +4312,14 @@ function ensureRealtimeSubtitleUi() {
   if (!panel) {
     panel = document.createElement('aside');
     panel.id = YT_RT_PANEL_ID;
+    document.body.appendChild(panel);
+  }
+
+  const hasPanelScaffold =
+    Boolean(panel.querySelector('[data-yt-rt-list]')) &&
+    Boolean(panel.querySelector('[data-yt-rt-load-cc]')) &&
+    Boolean(panel.querySelector('[data-yt-rt-hide]'));
+  if (!hasPanelScaffold) {
     panel.innerHTML = `
       <div class="yt-rt-panel__header">
         <span class="yt-rt-panel__title">实时翻译</span>
@@ -4290,11 +4330,13 @@ function ensureRealtimeSubtitleUi() {
       </div>
       <div class="yt-rt-panel__list" data-yt-rt-list></div>
     `;
-    document.body.appendChild(panel);
+  }
 
-    const loadCcBtn = panel.querySelector('[data-yt-rt-load-cc]');
-    const hideBtn = panel.querySelector('[data-yt-rt-hide]');
-    loadCcBtn?.addEventListener('click', async () => {
+  const loadCcBtn = panel.querySelector('[data-yt-rt-load-cc]');
+  const hideBtn = panel.querySelector('[data-yt-rt-hide]');
+  if (loadCcBtn && loadCcBtn.dataset.ytRtBound !== '1') {
+    loadCcBtn.dataset.ytRtBound = '1';
+    loadCcBtn.addEventListener('click', async () => {
       if (loadCcBtn.disabled) return;
       setButtonLoading(loadCcBtn, true, '加载中...');
       try {
@@ -4310,21 +4352,16 @@ function ensureRealtimeSubtitleUi() {
         setButtonLoading(loadCcBtn, false);
       }
     });
-    hideBtn?.addEventListener('click', () => {
+  }
+  if (hideBtn && hideBtn.dataset.ytRtBound !== '1') {
+    hideBtn.dataset.ytRtBound = '1';
+    hideBtn.addEventListener('click', () => {
       panel.classList.add('is-hidden');
-      document
-        .querySelector('ytd-watch-flexy')
-        ?.classList?.remove(
-          YT_RT_WATCH_ACTIVE_CLASS,
-          YT_RT_TARGET_FULL_CLASS,
-          YT_RT_TARGET_PLAYER_FULL_CLASS,
-          YT_RT_TARGET_PLAYER_CONTAINER_CLASS,
-          YT_RT_TARGET_SECONDARY_CLASS
-        );
+      clearRealtimeWatchLayoutClasses(document.querySelector('ytd-watch-flexy'));
       const reopenBtn = document.getElementById(YT_RT_REOPEN_BTN_ID);
       if (reopenBtn) reopenBtn.classList.add('is-active');
-      renderRealtimeSubtitleOverlay(null);
-      syncNativeCaptionVisibility();
+      forceRealtimePanelDockedLayout();
+      renderRealtimeSubtitleOverlay(ytRtItems[ytRtActiveIndex] || null);
     });
   }
 
@@ -4336,13 +4373,27 @@ function ensureRealtimeSubtitleUi() {
     reopenBtn.className = 'yt-rt-reopen-btn';
     reopenBtn.textContent = '实时翻译';
     reopenBtn.title = '显示实时翻译面板';
+    document.body.appendChild(reopenBtn);
+  }
+  if (reopenBtn.dataset.ytRtBound !== '1') {
+    reopenBtn.dataset.ytRtBound = '1';
     reopenBtn.addEventListener('click', () => {
       panel?.classList.remove('is-hidden');
       reopenBtn?.classList.remove('is-active');
-      syncRealtimePanelLayout();
+      forceRealtimePanelDockedLayout();
+      renderRealtimeSubtitleList();
+      syncRealtimeActiveItemByPlayback(true);
       renderRealtimeSubtitleOverlay(ytRtItems[ytRtActiveIndex] || null);
+      if (!ytRtItems.length) {
+        loadRealtimeTranscript(false)
+          .then(() => {
+            renderRealtimeSubtitleList();
+            syncRealtimeActiveItemByPlayback(true);
+            renderRealtimeSubtitleOverlay(ytRtItems[ytRtActiveIndex] || null);
+          })
+          .catch(() => {});
+      }
     });
-    document.body.appendChild(reopenBtn);
   }
 
   syncRealtimePanelLayout();
@@ -4444,10 +4495,9 @@ function pushRealtimeSourceOnlyItem(source, videoTimeSeconds = -1) {
 function renderRealtimeSubtitleOverlay(item) {
   const overlay = document.getElementById(YT_RT_OVERLAY_ID);
   if (!overlay) return;
-  const panel = document.getElementById(YT_RT_PANEL_ID);
   const sourceEl = overlay.querySelector('[data-yt-rt-source]');
   const translationEl = overlay.querySelector('[data-yt-rt-translation]');
-  if (!item || !panel || panel.classList.contains('is-hidden')) {
+  if (!item) {
     sourceEl.textContent = '';
     translationEl.textContent = '';
     overlay.classList.remove('is-active');
