@@ -41,6 +41,9 @@ const YT_RT_SEEK_JUMP_SECONDS = 2;
 const YT_RT_BUDGET_TOTAL = 300;
 const YT_RT_BUDGET_SEEK_RESERVE = 80;
 const YT_RT_FULL_TRANSCRIPT_RETRY_MS = 5000;
+const YT_RT_FULL_TRANSCRIPT_RETRY_HTML_MS = 12000;
+const YT_RT_FULL_TRANSCRIPT_RETRY_NO_SUB_MS = 45000;
+const YT_RT_FULL_TRANSCRIPT_RETRY_FAIL_MS = 10000;
 const YT_RT_ACTIVE_GROUP_MAX_SEGMENTS = 14;
 const YT_RT_ACTIVE_GROUP_TIMEOUT_MS = 9000;
 const YT_RT_FAST_STANDBY_CHUNKS = 1;
@@ -48,6 +51,7 @@ const YT_RT_CHUNK_RETRY_COOLDOWN_MS = 3500;
 const YT_RT_BACKFILL_STEP_BATCH = 4;
 const YT_RT_BACKFILL_BATCH_TRANSLATE_SIZE = 100;
 const YT_RT_BACKFILL_BATCH_RPC_SIZE = 20;
+const YT_RT_BACKFILL_GROUP_TARGET_SEGMENTS = 5;
 const YT_RT_BACKFILL_GROUP_MAX_SEGMENTS = 18;
 const YT_RT_BACKFILL_GROUP_MIN_SEGMENTS = 6;
 const YT_RT_BACKFILL_GROUP_MAX_CHARS = 1200;
@@ -102,6 +106,7 @@ let ytRtLoadingPromise = null;
 let ytRtNextLoadAt = 0;
 let ytRtAdDetectionStartedAt = 0;
 let ytRtLastPlaybackSeconds = -1;
+let ytRtLastVideoPausedState = null;
 const ytRtPlayerResponseCache = new Map();
 const ytRtTranslationCache = new Map();
 const ytRtCaptionTrackCache = new Map();
@@ -110,6 +115,7 @@ const ytRtBackfillFailedAt = new Map();
 const ytRtBudgetSourcesByVideo = new Map();
 const ytRtChunkInflight = new Map();
 const ytRtChunkLastRequestAt = new Map();
+const ytRtFullTranscriptInflightByVideo = new Map();
 const ytCaptionTrackWaiters = [];
 const ytCaptionBridgeFetchWaiters = new Map();
 let ytCaptionBridgeInitialized = false;
@@ -1793,6 +1799,7 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtLoadingPromise = null;
     ytRtNextLoadAt = 0;
     ytRtLastPlaybackSeconds = -1;
+    ytRtLastVideoPausedState = null;
     ytRtHtmlRetryAtByVideo.clear();
     ytRtSubtitleBlockedUntilByVideo.clear();
     ytRtNextFullTranscriptTryAtByVideo.clear();
@@ -1814,6 +1821,7 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtBudgetSourcesByVideo.clear();
     ytRtChunkInflight.clear();
     ytRtChunkLastRequestAt.clear();
+    ytRtFullTranscriptInflightByVideo.clear();
     renderRealtimeSubtitleList();
     renderRealtimeSubtitleOverlay(null);
   }
@@ -1941,6 +1949,7 @@ function teardownRealtimeSubtitleObserver() {
   ytRtLoadingPromise = null;
   ytRtNextLoadAt = 0;
   ytRtLastPlaybackSeconds = -1;
+  ytRtLastVideoPausedState = null;
   ytRtFastLaneInFlight = false;
   ytRtFastLaneVideoKey = '';
   ytRtFastLaneTargets = [];
@@ -1953,6 +1962,7 @@ function teardownRealtimeSubtitleObserver() {
   ytRtBudgetSourcesByVideo.clear();
   ytRtChunkInflight.clear();
   ytRtChunkLastRequestAt.clear();
+  ytRtFullTranscriptInflightByVideo.clear();
   ytRtNextFullTranscriptTryAtByVideo.clear();
   document
     .querySelector('ytd-watch-flexy')
@@ -2103,6 +2113,17 @@ function startRealtimePlaybackSync() {
   if (ytRtPlaybackTimer) return;
   ytRtPlaybackTimer = window.setInterval(() => {
     if (!ytRtEnabled) return;
+    const video = getCurrentVideoElement();
+    const paused = Boolean(video?.paused);
+    if (ytRtLastVideoPausedState !== paused) {
+      ytRtLastVideoPausedState = paused;
+      if (!paused) {
+        const videoKey = ytRtTranscriptLoadedVideoKey;
+        if (videoKey && hasUntranslatedTimelineItems()) {
+          scheduleBackfillLane(videoKey, 120);
+        }
+      }
+    }
     syncRealtimeActiveItemByPlayback(true);
   }, YT_RT_PLAYBACK_SYNC_MS);
 }
@@ -3357,6 +3378,7 @@ function scheduleBackfillLane(videoKey, delayMs = YT_RT_BACKFILL_IDLE_DELAY_MS) 
   if (!ytRtEnabled) return;
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!ytRtHasFullTimeline || !ytRtItems.length) return;
+  if (isCurrentVideoPaused()) return;
   clearTimeout(ytRtBackfillTimer);
   ytRtBackfillTimer = window.setTimeout(() => {
     runBackfillLane(videoKey).catch(() => {});
@@ -3467,6 +3489,7 @@ async function runBackfillLane(videoKey) {
   if (ytRtBackfillInFlight) return;
   if (!ytRtHasFullTimeline || !ytRtItems.length) return;
   if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
+  if (isCurrentVideoPaused()) return;
   if (ytRtFastLaneInFlight) {
     scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
     return;
@@ -3490,7 +3513,8 @@ async function runBackfillLane(videoKey) {
       }
       await translateEntryGroup(videoKey, group, {
         timeoutMs: YT_RT_BACKFILL_BATCH_TIMEOUT_MS,
-        allowSingleFallback: false
+        allowSingleFallback: false,
+        allowBatchFallback: true
       });
     }
   } finally {
@@ -3697,6 +3721,10 @@ function collectBackfillPendingEntries(targets) {
 
 function buildBackfillGroups(entries) {
   if (!entries.length) return [];
+  const sorted = [...entries].sort((a, b) => a.index - b.index);
+  const targetSegments = Math.max(2, Number(YT_RT_BACKFILL_GROUP_TARGET_SEGMENTS) || 5);
+  const maxSegments = Math.max(targetSegments, Number(YT_RT_BACKFILL_GROUP_MAX_SEGMENTS) || targetSegments);
+  const maxChars = Math.max(400, Number(YT_RT_BACKFILL_GROUP_MAX_CHARS) || 1200);
   const groups = [];
   let current = [];
   let currentChars = 0;
@@ -3707,21 +3735,14 @@ function buildBackfillGroups(entries) {
     currentChars = 0;
   };
 
-  entries.forEach((entry) => {
+  sorted.forEach((entry) => {
     const source = String(entry.source || '');
-    const prev = current.length ? current[current.length - 1] : null;
-    const prevEnd = Number(prev?.end || 0);
-    const nextStart = Number(entry.start || 0);
-    const gap = Number.isFinite(prevEnd) && Number.isFinite(nextStart) ? nextStart - prevEnd : 0;
-    const wouldExceedSegments = current.length >= YT_RT_BACKFILL_GROUP_MAX_SEGMENTS;
-    const wouldExceedChars =
-      currentChars + source.length > YT_RT_BACKFILL_GROUP_MAX_CHARS && current.length > 0;
-    const overGap = current.length > 0 && gap > YT_RT_BACKFILL_GROUP_MAX_GAP_SECONDS;
-    const punctuationBoundary =
-      current.length >= YT_RT_BACKFILL_GROUP_MIN_SEGMENTS &&
-      /[.!?。！？…]["')\]]*\s*$/.test(String(prev?.source || ''));
+    if (!source.trim()) return;
+    const wouldExceedChars = current.length > 0 && currentChars + source.length > maxChars;
+    const reachedTarget = current.length >= targetSegments;
+    const reachedMax = current.length >= maxSegments;
 
-    if (wouldExceedSegments || wouldExceedChars || overGap || punctuationBoundary) {
+    if (wouldExceedChars || reachedTarget || reachedMax) {
       pushCurrent();
     }
     current.push(entry);
@@ -3729,6 +3750,24 @@ function buildBackfillGroups(entries) {
   });
 
   pushCurrent();
+
+  // Merge tiny tail into previous group when safe, to reduce 1-2 segment requests.
+  if (groups.length >= 2) {
+    const tail = groups[groups.length - 1];
+    const prev = groups[groups.length - 2];
+    const tailChars = tail.reduce((sum, entry) => sum + String(entry?.source || '').length, 0);
+    const prevChars = prev.reduce((sum, entry) => sum + String(entry?.source || '').length, 0);
+    if (
+      tail.length > 0 &&
+      tail.length < Math.min(targetSegments, 3) &&
+      prev.length + tail.length <= maxSegments &&
+      prevChars + tailChars <= maxChars
+    ) {
+      prev.push(...tail);
+      groups.pop();
+    }
+  }
+
   return groups;
 }
 
@@ -3943,10 +3982,37 @@ async function requestRealtimeGroupedTranslationWithTimeout(sentences, timeoutMs
 }
 
 function loadRealtimeTranscript(forceReload = false) {
-  ytRtLoadingPromise = ensureRealtimeTranscriptLoaded(Boolean(forceReload)).finally(() => {
+  const isForceReload = Boolean(forceReload);
+  const videoKey = getCurrentYouTubeVideoKey();
+  if (
+    !isForceReload &&
+    ytRtLoadingPromise &&
+    videoKey &&
+    videoKey === ytRtTranscriptLoadingVideoKey
+  ) {
+    return ytRtLoadingPromise;
+  }
+
+  ytRtTranscriptLoadingVideoKey = videoKey;
+  ytRtLoadingPromise = ensureRealtimeTranscriptLoaded(isForceReload).finally(() => {
+    ytRtTranscriptLoadingVideoKey = '';
     ytRtLoadingPromise = null;
   });
   return ytRtLoadingPromise;
+}
+
+function resolveFullTranscriptRetryMs(status) {
+  const normalized = String(status || '').toUpperCase();
+  if (normalized === 'NO_SUBTITLES' || normalized === 'UNSUPPORTED') {
+    return YT_RT_FULL_TRANSCRIPT_RETRY_NO_SUB_MS;
+  }
+  if (normalized === 'HTML_RESPONSE') {
+    return YT_RT_FULL_TRANSCRIPT_RETRY_HTML_MS;
+  }
+  if (normalized === 'NETWORK_ERROR' || normalized === 'PARSE_ERROR') {
+    return YT_RT_FULL_TRANSCRIPT_RETRY_FAIL_MS;
+  }
+  return YT_RT_FULL_TRANSCRIPT_RETRY_MS;
 }
 
 async function ensureRealtimeTranscriptLoaded(forceReload = false) {
@@ -3970,14 +4036,20 @@ async function ensureRealtimeTranscriptLoaded(forceReload = false) {
     const nextTryAt = Number(ytRtNextFullTranscriptTryAtByVideo.get(videoKey) || 0);
     if (now >= nextTryAt) {
       ytRtFullTranscriptTriedVideoKey = videoKey;
+      ytRtNextFullTranscriptTryAtByVideo.set(videoKey, now + YT_RT_FULL_TRANSCRIPT_RETRY_MS);
       ytRtStatusText = 'CC 已开启，正在加载全量字幕...';
       renderRealtimeSubtitleList();
-      const fullLoaded = await tryLoadFullTranscriptOnce(videoKey);
-      if (fullLoaded) {
+      const fullLoadResult = await tryLoadFullTranscriptOnce(videoKey, {
+        allowBridgeFallback: Boolean(forceReload)
+      });
+      if (fullLoadResult.loaded) {
         ytRtNextFullTranscriptTryAtByVideo.delete(videoKey);
         return;
       }
-      ytRtNextFullTranscriptTryAtByVideo.set(videoKey, now + YT_RT_FULL_TRANSCRIPT_RETRY_MS);
+      ytRtNextFullTranscriptTryAtByVideo.set(
+        videoKey,
+        now + resolveFullTranscriptRetryMs(fullLoadResult.status)
+      );
     }
   }
 
@@ -4041,6 +4113,12 @@ function getCurrentVideoTimeSeconds() {
   return Number.isFinite(currentTime) ? currentTime : -1;
 }
 
+function isCurrentVideoPaused() {
+  const video = getCurrentVideoElement();
+  if (!video) return false;
+  return Boolean(video.paused);
+}
+
 function isYouTubeCcEnabled() {
   const ccBtn = document.querySelector('.ytp-subtitles-button');
   if (!ccBtn) return false;
@@ -4067,41 +4145,64 @@ function ensureYouTubeCcEnabled() {
   return false;
 }
 
-async function tryLoadFullTranscriptOnce(videoKey) {
-  try {
-    const track = await requestCaptionTrackFromBridge(videoKey);
-    let fallbackUrl = '';
-    if (!track?.baseUrl) {
-      fallbackUrl = await findTimedtextUrlFromPerformanceWithRetry(videoKey);
-    }
-    if (!track?.baseUrl && !fallbackUrl) return false;
+async function tryLoadFullTranscriptOnce(videoKey, options = {}) {
+  const key = String(videoKey || '').trim();
+  if (!key) return { loaded: false, status: 'INVALID_VIDEO' };
 
-    const pageContext = await buildPageContextPayload(videoKey, track, fallbackUrl);
-    const subtitleBundle = await requestSubtitleBundle(videoKey, track, fallbackUrl, pageContext);
-    const status = String(subtitleBundle?.status || '').toUpperCase();
-    if (status === 'OK') {
-      const items = mapSubtitleBundleToRealtimeItems(subtitleBundle, videoKey);
-      if (items.length) {
-        await applyLoadedRealtimeItems(videoKey, items);
-        ytRtHasFullTimeline = true;
-        return true;
+  const existing = ytRtFullTranscriptInflightByVideo.get(key);
+  if (existing) return existing;
+
+  const allowBridgeFallback = options?.allowBridgeFallback === true;
+  const loadingTask = (async () => {
+    try {
+      const track = await requestCaptionTrackFromBridge(key);
+      let fallbackUrl = '';
+      if (!track?.baseUrl) {
+        fallbackUrl = await findTimedtextUrlFromPerformanceWithRetry(key);
       }
-    }
-    if (status === 'HTML_RESPONSE' || status === 'NO_SUBTITLES') {
-      const fallbackItems = await tryLoadSubtitlesViaBridgeFallback(videoKey, track, fallbackUrl);
-      if (fallbackItems.length) {
-        await applyLoadedRealtimeItems(videoKey, fallbackItems);
-        ytRtHasFullTimeline = true;
-        return true;
+      if (!track?.baseUrl && !fallbackUrl) {
+        return { loaded: false, status: 'NO_SUBTITLES' };
       }
+
+      const pageContext = await buildPageContextPayload(key, track, fallbackUrl);
+      const subtitleBundle = await requestSubtitleBundle(key, track, fallbackUrl, pageContext);
+      const status = String(subtitleBundle?.status || '').toUpperCase();
+      if (status === 'OK') {
+        const items = mapSubtitleBundleToRealtimeItems(subtitleBundle, key);
+        if (items.length) {
+          await applyLoadedRealtimeItems(key, items);
+          ytRtHasFullTimeline = true;
+          return { loaded: true, status: 'OK' };
+        }
+        return { loaded: false, status: 'PARSE_ERROR' };
+      }
+
+      if (allowBridgeFallback && (status === 'HTML_RESPONSE' || status === 'NO_SUBTITLES')) {
+        const fallbackItems = await tryLoadSubtitlesViaBridgeFallback(key, track, fallbackUrl);
+        if (fallbackItems.length) {
+          await applyLoadedRealtimeItems(key, fallbackItems);
+          ytRtHasFullTimeline = true;
+          return { loaded: true, status: 'OK' };
+        }
+      }
+
+      return { loaded: false, status: status || 'FAILED' };
+    } catch (err) {
+      console.warn('[yt-cc] full transcript load failed', {
+        videoKey: key,
+        message: normalizeExtensionError(err)
+      });
+      return { loaded: false, status: 'NETWORK_ERROR' };
     }
-  } catch (err) {
-    console.warn('[yt-cc] full transcript load failed', {
-      videoKey,
-      message: normalizeExtensionError(err)
+  })()
+    .finally(() => {
+      if (ytRtFullTranscriptInflightByVideo.get(key) === loadingTask) {
+        ytRtFullTranscriptInflightByVideo.delete(key);
+      }
     });
-  }
-  return false;
+
+  ytRtFullTranscriptInflightByVideo.set(key, loadingTask);
+  return loadingTask;
 }
 
 function seekVideoToItem(item) {
