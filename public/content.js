@@ -67,6 +67,8 @@ let ytRtLayoutSyncTimer = 0;
 let ytRtLayoutSyncRaf = 0;
 let ytRtLayoutBurstTimers = [];
 let ytRtLayoutEventsBound = false;
+let ytRtWatchLayoutObserver = null;
+let ytRtWatchLayoutObservedEl = null;
 let ytRtQueuedText = '';
 let ytRtQueuedVideoTime = -1;
 let ytRtRequestInFlight = false;
@@ -1701,6 +1703,33 @@ function bindRealtimeLayoutEvents() {
   );
 }
 
+function ensureWatchFlexyLayoutObserver() {
+  const watchFlexy = document.querySelector('ytd-watch-flexy');
+  if (ytRtWatchLayoutObservedEl === watchFlexy && ytRtWatchLayoutObserver) {
+    return;
+  }
+  if (ytRtWatchLayoutObserver) {
+    ytRtWatchLayoutObserver.disconnect();
+    ytRtWatchLayoutObserver = null;
+  }
+  ytRtWatchLayoutObservedEl = watchFlexy || null;
+  if (!watchFlexy) return;
+  ytRtWatchLayoutObserver = new MutationObserver(() => {
+    scheduleRealtimePanelLayoutSyncBurst([0, 100, 260, 520]);
+  });
+  ytRtWatchLayoutObserver.observe(watchFlexy, {
+    attributes: true,
+    attributeFilter: [
+      'class',
+      'theater',
+      'theater-requested_',
+      'full-bleed-player',
+      'fullscreen',
+      'is-fullscreen_'
+    ]
+  });
+}
+
 function hasWatchFlexyMode(watchFlexy, token) {
   if (!watchFlexy || !token) return false;
   return Boolean(watchFlexy.hasAttribute?.(token) || watchFlexy.classList?.contains?.(token));
@@ -1735,6 +1764,7 @@ function maybeSetupRealtimeSubtitleObserver() {
     return;
   }
   ensureRealtimeSubtitleUi();
+  ensureWatchFlexyLayoutObserver();
   syncRealtimePanelLayout();
 
   const routeKey = `${location.host}${location.pathname}${location.search}`;
@@ -1820,9 +1850,11 @@ function syncRealtimePanelLayout() {
     return rect.width > 0 && rect.height > 0;
   };
   const isFullscreenMode = isYouTubeFullscreenMode(watchFlexy);
-  const preferFullBleedLayout = isFullscreenMode || isYouTubeFullBleedMode(watchFlexy);
+  const isFullBleedMode = isYouTubeFullBleedMode(watchFlexy);
   let targetContainer = null;
-  if (preferFullBleedLayout && fullBleedContainer) {
+  if (isFullscreenMode && fullBleedContainer) {
+    targetContainer = fullBleedContainer;
+  } else if (isFullBleedMode && isVisibleContainer(fullBleedContainer)) {
     targetContainer = fullBleedContainer;
   } else if (!isFullscreenMode && isVisibleContainer(secondaryContainer)) {
     targetContainer = secondaryContainer;
@@ -1872,6 +1904,11 @@ function teardownRealtimeSubtitleObserver() {
     ytRtObserver.disconnect();
     ytRtObserver = null;
   }
+  if (ytRtWatchLayoutObserver) {
+    ytRtWatchLayoutObserver.disconnect();
+    ytRtWatchLayoutObserver = null;
+  }
+  ytRtWatchLayoutObservedEl = null;
   clearTimeout(ytRtDebounceTimer);
   ytRtDebounceTimer = 0;
   clearTimeout(ytRtLayoutSyncTimer);
