@@ -28,19 +28,23 @@ const YT_PERF_SCAN_DELAYS_MS = [500, 1000, 2000];
 const YT_RT_AD_RETRY_MS = 1500;
 const YT_RT_HTML_RETRY_COOLDOWN_MS = 6000;
 const YT_RT_HTML_HARD_COOLDOWN_MS = 30000;
-const YT_RT_OVERLAY_POS_KEY = 'yt-rt-overlay-pos-v1';
+const YT_RT_OVERLAY_POS_KEY = 'yt-rt-overlay-pos-v2';
 const YT_RT_FAST_PREFETCH_AHEAD = 1;
 const YT_RT_FAST_TIMEOUT_MS = 4200;
 const YT_RT_ACTIVE_PREFETCH_AHEAD = 1;
 const YT_RT_PLAYBACK_SYNC_MS = 120;
-const YT_RT_TRANSLATE_WINDOW_AHEAD = 10;
-const YT_RT_TRANSLATE_WINDOW_BEHIND = 0;
-const YT_RT_SEEK_WINDOW_AHEAD = 6;
-const YT_RT_SEEK_WINDOW_BEHIND = 2;
+const YT_RT_TRANSLATE_WINDOW_AHEAD = 12;
+const YT_RT_TRANSLATE_WINDOW_BEHIND = 2;
+const YT_RT_SEEK_WINDOW_AHEAD = 10;
+const YT_RT_SEEK_WINDOW_BEHIND = 3;
 const YT_RT_SEEK_JUMP_SECONDS = 2;
 const YT_RT_BUDGET_TOTAL = 300;
 const YT_RT_BUDGET_SEEK_RESERVE = 80;
 const YT_RT_FULL_TRANSCRIPT_RETRY_MS = 5000;
+const YT_RT_ACTIVE_GROUP_MAX_SEGMENTS = 14;
+const YT_RT_ACTIVE_GROUP_TIMEOUT_MS = 9000;
+const YT_RT_FAST_STANDBY_CHUNKS = 1;
+const YT_RT_CHUNK_RETRY_COOLDOWN_MS = 3500;
 const YT_RT_BACKFILL_STEP_BATCH = 4;
 const YT_RT_BACKFILL_BATCH_TRANSLATE_SIZE = 100;
 const YT_RT_BACKFILL_BATCH_RPC_SIZE = 20;
@@ -87,6 +91,8 @@ let ytRtFastLaneInFlight = false;
 let ytRtFastLaneEpoch = 0;
 let ytRtFastLaneVideoKey = '';
 let ytRtFastLaneTargets = [];
+let ytRtFastLanePendingSeek = false;
+let ytRtFastLanePrimaryChunkStart = -1;
 let ytRtBackfillInFlight = false;
 let ytRtBackfillTimer = 0;
 let ytRtBackfillCursor = 0;
@@ -102,6 +108,8 @@ const ytRtCaptionTrackCache = new Map();
 const ytRtTranslationInflight = new Map();
 const ytRtBackfillFailedAt = new Map();
 const ytRtBudgetSourcesByVideo = new Map();
+const ytRtChunkInflight = new Map();
+const ytRtChunkLastRequestAt = new Map();
 const ytCaptionTrackWaiters = [];
 const ytCaptionBridgeFetchWaiters = new Map();
 let ytCaptionBridgeInitialized = false;
@@ -1794,6 +1802,8 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtFastLaneEpoch += 1;
     ytRtFastLaneVideoKey = '';
     ytRtFastLaneTargets = [];
+    ytRtFastLanePendingSeek = false;
+    ytRtFastLanePrimaryChunkStart = -1;
     ytRtBackfillInFlight = false;
     ytRtBackfillCursor = 0;
     clearTimeout(ytRtBackfillTimer);
@@ -1802,6 +1812,8 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtTranslationInflight.clear();
     ytRtBackfillFailedAt.clear();
     ytRtBudgetSourcesByVideo.clear();
+    ytRtChunkInflight.clear();
+    ytRtChunkLastRequestAt.clear();
     renderRealtimeSubtitleList();
     renderRealtimeSubtitleOverlay(null);
   }
@@ -1932,11 +1944,15 @@ function teardownRealtimeSubtitleObserver() {
   ytRtFastLaneInFlight = false;
   ytRtFastLaneVideoKey = '';
   ytRtFastLaneTargets = [];
+  ytRtFastLanePendingSeek = false;
+  ytRtFastLanePrimaryChunkStart = -1;
   ytRtBackfillInFlight = false;
   ytRtBackfillCursor = 0;
   ytRtTranslationInflight.clear();
   ytRtBackfillFailedAt.clear();
   ytRtBudgetSourcesByVideo.clear();
+  ytRtChunkInflight.clear();
+  ytRtChunkLastRequestAt.clear();
   ytRtNextFullTranscriptTryAtByVideo.clear();
   document
     .querySelector('ytd-watch-flexy')
@@ -2731,6 +2747,7 @@ async function applyLoadedRealtimeItems(videoKey, items) {
     renderRealtimeSubtitleList();
   }
   triggerActiveSentenceTranslation(videoKey, ytRtActiveIndex);
+  scheduleBackfillLane(videoKey, 1800);
 }
 
 function getYouTubePlayerResponse() {
@@ -3275,39 +3292,7 @@ function triggerActiveSentenceTranslation(videoKey, index, { isSeek = false } = 
   if (!ytRtEnabled) return;
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!Number.isInteger(index) || index < 0 || index >= ytRtItems.length) return;
-  translateTimelineItemByIndex(videoKey, index, {
-    timeoutMs: YT_RT_FAST_TIMEOUT_MS,
-    markBackfillFailure: false,
-    budgetMode: 'seek'
-  }).catch(() => {});
-
-  const ahead = isSeek ? YT_RT_SEEK_WINDOW_AHEAD : YT_RT_TRANSLATE_WINDOW_AHEAD;
-  const behind = isSeek ? YT_RT_SEEK_WINDOW_BEHIND : YT_RT_TRANSLATE_WINDOW_BEHIND;
-  prefetchUpcomingRealtimeTranslations(videoKey, index, {
-    ahead,
-    behind,
-    budgetMode: isSeek ? 'seek' : 'normal'
-  });
-}
-
-function prefetchUpcomingRealtimeTranslations(
-  videoKey,
-  centerIndex,
-  { ahead = YT_RT_ACTIVE_PREFETCH_AHEAD, behind = 0, budgetMode = 'normal' } = {}
-) {
-  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
-  if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return;
-
-  const min = Math.max(0, centerIndex - Math.max(0, Number(behind) || 0));
-  const max = Math.min(ytRtItems.length - 1, centerIndex + Math.max(0, Number(ahead) || 0));
-  for (let idx = min; idx <= max; idx += 1) {
-    if (idx === centerIndex) continue;
-    translateTimelineItemByIndex(videoKey, idx, {
-      timeoutMs: YT_RT_FAST_TIMEOUT_MS,
-      markBackfillFailure: false,
-      budgetMode
-    }).catch(() => {});
-  }
+  scheduleRealtimeTranslation(videoKey, index, { isSeek });
 }
 
 function updateRealtimeActiveRow(shouldScroll = false) {
@@ -3355,17 +3340,16 @@ function updateRealtimeItemTranslation(itemId, translation) {
   rowTranslation.classList.toggle('is-empty', !translation);
 }
 
-function scheduleRealtimeTranslation(videoKey, centerIndex) {
+function scheduleRealtimeTranslation(videoKey, centerIndex, { isSeek = false } = {}) {
   if (!ytRtEnabled) return;
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return;
 
   ytRtFastLaneVideoKey = videoKey;
   ytRtFastLaneEpoch += 1;
-  ytRtFastLaneTargets = [centerIndex];
-  if (centerIndex + YT_RT_FAST_PREFETCH_AHEAD < ytRtItems.length) {
-    ytRtFastLaneTargets.push(centerIndex + YT_RT_FAST_PREFETCH_AHEAD);
-  }
+  ytRtFastLaneTargets = buildFastLaneChunkStarts(centerIndex, { isSeek });
+  ytRtFastLanePendingSeek = Boolean(isSeek);
+  ytRtFastLanePrimaryChunkStart = ytRtFastLaneTargets.length ? ytRtFastLaneTargets[0] : -1;
   runFastLane();
 }
 
@@ -3387,15 +3371,19 @@ async function runFastLane() {
       const epoch = ytRtFastLaneEpoch;
       const videoKey = ytRtFastLaneVideoKey;
       if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
-      const index = ytRtFastLaneTargets.shift();
-      if (!Number.isInteger(index)) continue;
-      await translateTimelineItemByIndex(videoKey, index, {
-        timeoutMs: YT_RT_FAST_TIMEOUT_MS,
-        markBackfillFailure: false
-      });
-      // Active moved while request in-flight; switch to newest targets immediately.
-      if (epoch !== ytRtFastLaneEpoch) {
-        continue;
+      const primaryChunkStart = ytRtFastLanePrimaryChunkStart;
+      const chunkStarts = Array.from(new Set(ytRtFastLaneTargets.filter((item) => Number.isInteger(item))));
+      const isSeek = ytRtFastLanePendingSeek;
+      ytRtFastLaneTargets = [];
+      for (const chunkStart of chunkStarts) {
+        if (epoch !== ytRtFastLaneEpoch) {
+          break;
+        }
+        await translateTimelineChunk(videoKey, chunkStart, {
+          isSeek,
+          allowSingleFallback: chunkStart === primaryChunkStart,
+          activeIndex: ytRtActiveIndex
+        });
       }
     }
   } finally {
@@ -3404,6 +3392,75 @@ async function runFastLane() {
       window.setTimeout(() => runFastLane(), 0);
     }
   }
+}
+
+function getChunkStartForIndex(index) {
+  const size = Math.max(1, Number(YT_RT_ACTIVE_GROUP_MAX_SEGMENTS) || 1);
+  return Math.max(0, Math.floor(index / size) * size);
+}
+
+function buildFastLaneChunkStarts(centerIndex, { isSeek = false } = {}) {
+  if (!Number.isInteger(centerIndex) || centerIndex < 0) return [];
+  const size = Math.max(1, Number(YT_RT_ACTIVE_GROUP_MAX_SEGMENTS) || 1);
+  const total = ytRtItems.length;
+  if (!total) return [];
+  const starts = [];
+  const currentStart = getChunkStartForIndex(centerIndex);
+  starts.push(currentStart);
+
+  const standbyCount = Math.max(0, Number(YT_RT_FAST_STANDBY_CHUNKS) || 0);
+  for (let step = 1; step <= standbyCount; step += 1) {
+    const nextStart = currentStart + size * step;
+    if (nextStart < total) starts.push(nextStart);
+  }
+  if (isSeek) {
+    const prevStart = currentStart - size;
+    if (prevStart >= 0) starts.push(prevStart);
+  }
+  return Array.from(new Set(starts));
+}
+
+async function translateTimelineChunk(
+  videoKey,
+  chunkStart,
+  { isSeek = false, allowSingleFallback = false, activeIndex = -1 } = {}
+) {
+  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return false;
+  if (!Number.isInteger(chunkStart) || chunkStart < 0 || chunkStart >= ytRtItems.length) return false;
+
+  const chunkKey = `${videoKey}:${chunkStart}`;
+  const existing = ytRtChunkInflight.get(chunkKey);
+  if (existing) {
+    await existing;
+    return true;
+  }
+
+  const now = Date.now();
+  if (!isSeek) {
+    const lastAt = Number(ytRtChunkLastRequestAt.get(chunkKey) || 0);
+    if (lastAt > 0 && now - lastAt < YT_RT_CHUNK_RETRY_COOLDOWN_MS) {
+      return false;
+    }
+  }
+  const size = Math.max(1, Number(YT_RT_ACTIVE_GROUP_MAX_SEGMENTS) || 1);
+  const chunkEnd = Math.min(ytRtItems.length - 1, chunkStart + size - 1);
+  const budgetMode = isSeek ? 'seek' : 'normal';
+  const entries = collectChunkPendingEntries(videoKey, chunkStart, chunkEnd, { budgetMode, activeIndex });
+  if (!entries.length) return true;
+
+  ytRtChunkLastRequestAt.set(chunkKey, now);
+  const promise = translateEntryGroup(videoKey, entries, {
+    timeoutMs: isSeek ? YT_RT_FAST_TIMEOUT_MS : YT_RT_ACTIVE_GROUP_TIMEOUT_MS,
+    allowSingleFallback: true,
+    activeIndex,
+    allowBatchFallback: false
+  }).finally(() => {
+    if (ytRtChunkInflight.get(chunkKey) === promise) {
+      ytRtChunkInflight.delete(chunkKey);
+    }
+  });
+  ytRtChunkInflight.set(chunkKey, promise);
+  return promise;
 }
 
 async function runBackfillLane(videoKey) {
@@ -3431,41 +3488,181 @@ async function runBackfillLane(videoKey) {
         scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
         return;
       }
-      const translations = await requestRealtimeGroupedTranslationWithTimeout(
-        group.map((entry) => entry.source),
-        YT_RT_BACKFILL_BATCH_TIMEOUT_MS
-      );
-      if (translations.length === group.length) {
-        applyBackfillTranslations(videoKey, group, translations);
-        continue;
-      }
-
-      // Group request failed: fall back to segmented batch, then per-item.
-      const segmented = await requestRealtimeBatchTranslationWithTimeout(
-        group.map((entry) => entry.source),
-        YT_RT_BACKFILL_BATCH_TIMEOUT_MS
-      );
-      if (segmented.length === group.length) {
-        applyBackfillTranslations(videoKey, group, segmented);
-        continue;
-      }
-
-      for (const entry of group) {
-        if (videoKey !== ytRtTranscriptLoadedVideoKey) return;
-        if (ytRtFastLaneInFlight) {
-          scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
-          return;
-        }
-        await translateTimelineItemByIndex(videoKey, entry.index, {
-          timeoutMs: 2600,
-          markBackfillFailure: true
-        });
-      }
+      await translateEntryGroup(videoKey, group, {
+        timeoutMs: YT_RT_BACKFILL_BATCH_TIMEOUT_MS,
+        allowSingleFallback: false
+      });
     }
   } finally {
     ytRtBackfillInFlight = false;
     if (videoKey === ytRtTranscriptLoadedVideoKey && hasUntranslatedTimelineItems()) {
       scheduleBackfillLane(videoKey, YT_RT_BACKFILL_IDLE_DELAY_MS);
+    }
+  }
+}
+
+function collectWindowPendingEntries(
+  videoKey,
+  centerIndex,
+  { ahead = YT_RT_TRANSLATE_WINDOW_AHEAD, behind = YT_RT_TRANSLATE_WINDOW_BEHIND, budgetMode = 'normal', limit = 0 } = {}
+) {
+  if (!Number.isInteger(centerIndex) || centerIndex < 0 || centerIndex >= ytRtItems.length) return [];
+  const min = Math.max(0, centerIndex - Math.max(0, Number(behind) || 0));
+  const max = Math.min(ytRtItems.length - 1, centerIndex + Math.max(0, Number(ahead) || 0));
+  const maxCount = Math.max(0, Number(limit) || 0);
+  const now = Date.now();
+  const entries = [];
+  const candidates = [centerIndex];
+  const maxDistance = Math.max(centerIndex - min, max - centerIndex);
+  for (let distance = 1; distance <= maxDistance; distance += 1) {
+    const left = centerIndex - distance;
+    const right = centerIndex + distance;
+    if (left >= min) candidates.push(left);
+    if (right <= max) candidates.push(right);
+  }
+
+  for (const index of candidates) {
+    const item = ytRtItems[index];
+    if (!item || item.translation) continue;
+    const source = String(item.source || '').trim();
+    if (!source) continue;
+    if (ytRtTranslationCache.has(source)) {
+      const cached = ytRtTranslationCache.get(source);
+      item.translation = cached;
+      updateRealtimeItemTranslation(item.id, cached);
+      if (item.id === ytRtActiveItemId) {
+        renderRealtimeSubtitleOverlay(item);
+      }
+      continue;
+    }
+    if (ytRtTranslationInflight.has(source)) continue;
+    const failedAt = Number(ytRtBackfillFailedAt.get(item.id) || 0);
+    if (index !== centerIndex && failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) {
+      continue;
+    }
+    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) continue;
+    entries.push({
+      index,
+      id: item.id,
+      source,
+      start: Number(item.videoTimeSeconds || 0),
+      end: Number(item.endTimeSeconds || 0)
+    });
+    if (maxCount > 0 && entries.length >= maxCount) break;
+  }
+
+  entries.sort((a, b) => a.index - b.index);
+  return entries;
+}
+
+function collectChunkPendingEntries(
+  videoKey,
+  chunkStart,
+  chunkEnd,
+  { budgetMode = 'normal', activeIndex = -1 } = {}
+) {
+  if (!Number.isInteger(chunkStart) || !Number.isInteger(chunkEnd) || chunkStart > chunkEnd) return [];
+  const now = Date.now();
+  const entries = [];
+  for (let index = chunkStart; index <= chunkEnd; index += 1) {
+    const item = ytRtItems[index];
+    if (!item || item.translation) continue;
+    const source = String(item.source || '').trim();
+    if (!source) continue;
+    if (ytRtTranslationCache.has(source)) {
+      const cached = ytRtTranslationCache.get(source);
+      item.translation = cached;
+      updateRealtimeItemTranslation(item.id, cached);
+      if (item.id === ytRtActiveItemId) {
+        renderRealtimeSubtitleOverlay(item);
+      }
+      continue;
+    }
+    if (ytRtTranslationInflight.has(source)) continue;
+    const failedAt = Number(ytRtBackfillFailedAt.get(item.id) || 0);
+    if (index !== activeIndex && failedAt > 0 && now - failedAt < YT_RT_BACKFILL_RETRY_COOLDOWN_MS) {
+      continue;
+    }
+    if (!canConsumeTranslateBudget(videoKey, source, budgetMode)) continue;
+    entries.push({
+      index,
+      id: item.id,
+      source,
+      start: Number(item.videoTimeSeconds || 0),
+      end: Number(item.endTimeSeconds || 0)
+    });
+  }
+  return entries;
+}
+
+function markEntriesFailed(entries) {
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry?.id) continue;
+    ytRtBackfillFailedAt.set(entry.id, now);
+  }
+}
+
+async function translateEntryGroup(
+  videoKey,
+  entries,
+  {
+    timeoutMs = YT_RT_BACKFILL_BATCH_TIMEOUT_MS,
+    allowSingleFallback = false,
+    activeIndex = -1,
+    allowBatchFallback = false
+  } = {}
+) {
+  if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return false;
+  if (!Array.isArray(entries) || !entries.length) return false;
+
+  let resolveInflight = null;
+  const inflightMarker = new Promise((resolve) => {
+    resolveInflight = resolve;
+  });
+  const inflightSources = new Set();
+  for (const entry of entries) {
+    if (!entry?.source || inflightSources.has(entry.source)) continue;
+    ytRtTranslationInflight.set(entry.source, inflightMarker);
+    inflightSources.add(entry.source);
+  }
+
+  try {
+    const sources = entries.map((entry) => entry.source);
+    let translations = await requestRealtimeGroupedTranslationWithTimeout(sources, timeoutMs);
+    if (allowBatchFallback && translations.length !== entries.length) {
+      translations = await requestRealtimeBatchTranslationWithTimeout(sources, timeoutMs);
+    }
+    if (translations.length === entries.length) {
+      applyBackfillTranslations(videoKey, entries, translations);
+      return true;
+    }
+
+    if (allowSingleFallback) {
+      const fallbackEntry =
+        entries.find((entry) => entry.index === activeIndex) ||
+        entries.find((entry) => entry.id === ytRtActiveItemId) ||
+        entries[0];
+      if (fallbackEntry?.source) {
+        const fallbackTranslation = await requestRealtimeSentenceTranslationWithTimeout(
+          fallbackEntry.source,
+          Math.max(1200, Math.min(Number(timeoutMs) || YT_RT_FAST_TIMEOUT_MS, YT_RT_FAST_TIMEOUT_MS))
+        );
+        if (fallbackTranslation) {
+          applyBackfillTranslations(videoKey, [fallbackEntry], [fallbackTranslation]);
+          return true;
+        }
+      }
+    }
+
+    markEntriesFailed(entries);
+    return false;
+  } finally {
+    if (resolveInflight) resolveInflight('');
+    for (const source of inflightSources) {
+      if (ytRtTranslationInflight.get(source) === inflightMarker) {
+        ytRtTranslationInflight.delete(source);
+      }
     }
   }
 }

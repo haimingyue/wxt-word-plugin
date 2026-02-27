@@ -1067,40 +1067,59 @@ async function deepseekTranslateGroupedHandler(payload) {
   if (!segments.length) throw new Error('缺少分组句子');
   if (segments.length > 40) throw new Error('分组句子过多');
 
-  const numbered = segments.map((sentence, idx) => `[${idx + 1}] ${sentence}`).join('\n');
+  const separator = '\n\n%%\n\n';
+  const content = segments.join(separator);
   const prompt = [
-    '你是中英翻译助手。',
-    '以下内容是同一段上下文中的连续英文字幕片段，请参考整体语境，逐条翻译成中文。',
-    '每一条必须与输入片段一一对应，不可合并、不可遗漏。',
-    '输出必须是 JSON，且只输出 JSON。',
-    '格式：{"translations":["第1条译文","第2条译文",...]}',
-    'translations 数组长度必须与输入条数完全一致，顺序必须一致。'
+    '你是一个专业的简体中文母语译者，需将文本流畅地翻译为简体中文。',
+    '翻译规则：',
+    '1) 仅输出译文内容，禁止解释或添加额外文字。',
+    '2) 必须保持与输入完全相同的段落数量与顺序。',
+    '3) 段落之间必须使用分隔符“%%”分隔，且分隔数量保持一致。',
+    '4) 不可合并段落，不可遗漏段落。'
   ].join('\n');
   const raw = await deepseekChat([
     { role: 'system', content: prompt },
-    { role: 'user', content: `片段列表：\n${numbered}` }
+    { role: 'user', content: `翻译为简体中文：\n\n${content}` }
   ]);
+
+  const normalized = parseGroupedTranslationsOutput(raw, segments.length);
+  if (normalized.length !== segments.length) {
+    throw new Error('分组翻译结果数量不匹配');
+  }
+  return normalized;
+}
+
+function parseGroupedTranslationsOutput(raw, expectedCount) {
   const cleaned = String(raw || '')
     .trim()
-    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/^```(?:json|text)?\s*/i, '')
     .replace(/\s*```$/, '');
 
   let parsed: any = null;
   try {
     parsed = JSON.parse(cleaned);
   } catch (_) {
-    // no-op
+    parsed = null;
   }
-  const translations = Array.isArray(parsed?.translations)
+  const jsonTranslations = Array.isArray(parsed?.translations)
     ? parsed.translations
     : Array.isArray(parsed)
       ? parsed
       : [];
-  const normalized = translations.map((item) => String(item || '').trim());
-  if (normalized.length !== segments.length) {
-    throw new Error('分组翻译结果数量不匹配');
+  const normalizedJson = jsonTranslations.map((item) => String(item || '').trim());
+  if (normalizedJson.length === expectedCount) {
+    return normalizedJson;
   }
-  return normalized;
+
+  const bySeparator = cleaned
+    .split(/\n\s*%%\s*\n/g)
+    .map((item) => String(item || '').trim())
+    .filter((item) => item.length > 0);
+  if (bySeparator.length === expectedCount) {
+    return bySeparator;
+  }
+
+  return [];
 }
 
 async function deepseekParseSentenceHandler(payload) {
