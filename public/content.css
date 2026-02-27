@@ -780,6 +780,10 @@ ytd-watch-flexy.yt-rt-vertical-view-active #full-bleed-container #yt-rt-translat
   font-weight: 500;
 }
 
+#yt-rt-translate-overlay .yt-rt-overlay__translation.is-loading {
+  color: #cbd5e1;
+}
+
 ytd-watch-flexy.yt-rt-hide-native-captions .ytp-caption-window-container,
 ytd-watch-flexy.yt-rt-hide-native-captions .caption-window.ytp-caption-window-bottom,
 ytd-watch-flexy.yt-rt-hide-native-captions .ytp-caption-segment,

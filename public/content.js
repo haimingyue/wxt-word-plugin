@@ -38,6 +38,7 @@ const YT_RT_TRANSLATE_WINDOW_BEHIND = 2;
 const YT_RT_SEEK_WINDOW_AHEAD = 10;
 const YT_RT_SEEK_WINDOW_BEHIND = 3;
 const YT_RT_SEEK_JUMP_SECONDS = 2;
+const YT_RT_INITIAL_ACTIVE_SKIP_COUNT = 3;
 const YT_RT_BUDGET_TOTAL = 300;
 const YT_RT_BUDGET_SEEK_RESERVE = 80;
 const YT_RT_FULL_TRANSCRIPT_RETRY_MS = 5000;
@@ -97,6 +98,7 @@ let ytRtFastLaneVideoKey = '';
 let ytRtFastLaneTargets = [];
 let ytRtFastLanePendingSeek = false;
 let ytRtFastLanePrimaryChunkStart = -1;
+let ytRtInitialActiveSkipRemaining = 0;
 let ytRtBackfillInFlight = false;
 let ytRtBackfillTimer = 0;
 let ytRtBackfillCursor = 0;
@@ -1840,6 +1842,7 @@ function maybeSetupRealtimeSubtitleObserver() {
     ytRtFastLaneTargets = [];
     ytRtFastLanePendingSeek = false;
     ytRtFastLanePrimaryChunkStart = -1;
+    ytRtInitialActiveSkipRemaining = 0;
     ytRtBackfillInFlight = false;
     ytRtBackfillCursor = 0;
     clearTimeout(ytRtBackfillTimer);
@@ -1987,6 +1990,7 @@ function teardownRealtimeSubtitleObserver() {
   ytRtFastLaneTargets = [];
   ytRtFastLanePendingSeek = false;
   ytRtFastLanePrimaryChunkStart = -1;
+  ytRtInitialActiveSkipRemaining = 0;
   ytRtBackfillInFlight = false;
   ytRtBackfillCursor = 0;
   ytRtTranslationInflight.clear();
@@ -2792,6 +2796,10 @@ async function applyLoadedRealtimeItems(videoKey, items) {
   ytRtActiveItemId = '';
   ytRtActiveIndex = -1;
   ytRtLastPlaybackSeconds = -1;
+  ytRtInitialActiveSkipRemaining = Math.max(
+    0,
+    Math.min(Number(YT_RT_INITIAL_ACTIVE_SKIP_COUNT) || 0, items.length)
+  );
   renderRealtimeSubtitleList();
   syncRealtimeActiveItemByPlayback(true);
 
@@ -3345,6 +3353,15 @@ function triggerActiveSentenceTranslation(videoKey, index, { isSeek = false } = 
   if (!ytRtEnabled) return;
   if (!videoKey || videoKey !== ytRtTranscriptLoadedVideoKey) return;
   if (!Number.isInteger(index) || index < 0 || index >= ytRtItems.length) return;
+  if (!isSeek && ytRtInitialActiveSkipRemaining > 0) {
+    ytRtInitialActiveSkipRemaining -= 1;
+    const ahead = Math.max(1, Number(YT_RT_INITIAL_ACTIVE_SKIP_COUNT) || 1);
+    const prefetchIndex = Math.min(ytRtItems.length - 1, index + ahead);
+    if (prefetchIndex > index) {
+      scheduleRealtimeTranslation(videoKey, prefetchIndex, { isSeek: false });
+    }
+    return;
+  }
   scheduleRealtimeTranslation(videoKey, index, { isSeek });
 }
 
@@ -4506,25 +4523,17 @@ function renderRealtimeSubtitleOverlay(item) {
 
   const source = String(item.source || '').trim();
   const translation = String(item.translation || '').trim();
-  const isActive = item.id === ytRtActiveItemId;
-  const isPending = Boolean(source) && ytRtTranslationInflight.has(source);
-  const shouldHoldForSync =
-    isActive &&
-    !translation &&
-    ytRtOverlayPendingItemId === ytRtActiveItemId &&
-    isPending;
-
-  if (shouldHoldForSync) {
-    sourceEl.textContent = '';
+  sourceEl.innerHTML = buildRealtimeSourceHtml(source);
+  if (ytRtCanTranslate === false) {
     translationEl.textContent = '';
     translationEl.style.display = 'none';
-    overlay.classList.remove('is-active');
-    return;
+    translationEl.classList.remove('is-loading');
+  } else {
+    const pendingText = translation || '翻译中';
+    translationEl.textContent = pendingText;
+    translationEl.style.display = 'block';
+    translationEl.classList.toggle('is-loading', !translation);
   }
-
-  sourceEl.innerHTML = buildRealtimeSourceHtml(source);
-  translationEl.textContent = translation;
-  translationEl.style.display = ytRtCanTranslate === false || !translation ? 'none' : 'block';
   overlay.classList.add('is-active');
 }
 
