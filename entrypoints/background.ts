@@ -1403,11 +1403,21 @@ function summarizeTimedtextUrlForDebug(rawUrl) {
     host: '',
     path: '',
     v: '',
+    ei: '',
+    opi: '',
     lang: '',
+    hl: '',
     tlang: '',
     kind: '',
     caps: '',
     fmt: '',
+    key: '',
+    exp: '',
+    xoaf: '',
+    xowf: '',
+    xospf: '',
+    sparams: '',
+    hasSparams: false,
     hasExpire: false,
     expireAtSec: 0,
     isExpired: false,
@@ -1423,11 +1433,21 @@ function summarizeTimedtextUrlForDebug(rawUrl) {
     summary.host = String(url.host || '').trim();
     summary.path = String(url.pathname || '').trim();
     summary.v = normalizeYoutubeVideoId(pick('v'));
+    summary.ei = pick('ei');
+    summary.opi = pick('opi');
     summary.lang = pick('lang');
+    summary.hl = pick('hl');
     summary.tlang = pick('tlang');
     summary.kind = pick('kind');
     summary.caps = pick('caps');
     summary.fmt = pick('fmt');
+    summary.key = pick('key');
+    summary.exp = pick('exp');
+    summary.xoaf = pick('xoaf');
+    summary.xowf = pick('xowf');
+    summary.xospf = pick('xospf');
+    summary.sparams = pick('sparams');
+    summary.hasSparams = Boolean(summary.sparams);
     const expireRaw = Number(pick('expire'));
     const nowSec = Date.now() / 1000;
     summary.hasExpire = Boolean(pick('expire'));
@@ -1439,6 +1459,100 @@ function summarizeTimedtextUrlForDebug(rawUrl) {
     return summary;
   } catch (_) {
     return summary;
+  }
+}
+
+function getTimedtextSignedParamSet(url) {
+  const raw = String(url?.searchParams?.get?.('sparams') || '')
+    .split(',')
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+  return new Set(raw);
+}
+
+function setTimedtextParamDefault(url, signedSet, key, value) {
+  if (!url || !key) return;
+  if (url.searchParams.has(key)) return;
+  if (signedSet?.has?.(key)) return;
+  const cleanValue = String(value || '').trim();
+  if (!cleanValue) return;
+  url.searchParams.set(key, cleanValue);
+}
+
+function mergeTimedtextParamsFromDonor(baseUrl, donorUrl) {
+  const primary = String(baseUrl || '').trim();
+  const donor = String(donorUrl || '').trim();
+  if (!primary || !donor || primary === donor) return primary;
+  try {
+    const primaryUrl = new URL(primary);
+    const donorParsed = new URL(donor);
+    const signedSet = getTimedtextSignedParamSet(primaryUrl);
+    const keys = [
+      'ei',
+      'opi',
+      'exp',
+      'xoaf',
+      'xowf',
+      'xospf',
+      'ip',
+      'ipbits',
+      'expire',
+      'sparams',
+      'signature',
+      'sig',
+      'lsig',
+      'pot',
+      'key',
+      'lang',
+      'hl',
+      'v'
+    ];
+    keys.forEach((key) => {
+      if (primaryUrl.searchParams.has(key)) return;
+      if (signedSet.has(key)) return;
+      const value = String(donorParsed.searchParams.get(key) || '').trim();
+      if (!value) return;
+      primaryUrl.searchParams.set(key, value);
+    });
+    return primaryUrl.toString();
+  } catch (_) {
+    return primary;
+  }
+}
+
+function buildCanonicalTimedtextUrl(baseUrl, options = {}) {
+  const primary = String(baseUrl || '').trim();
+  if (!primary) return '';
+  const donorUrl = String(options?.donorUrl || '').trim();
+  const merged = donorUrl ? mergeTimedtextParamsFromDonor(primary, donorUrl) : primary;
+  try {
+    const url = new URL(merged);
+    const signedSet = getTimedtextSignedParamSet(url);
+    const format = String(options?.format || '').trim().toLowerCase();
+    const language = String(options?.language || url.searchParams.get('lang') || 'en').trim() || 'en';
+    const preferAsr = options?.preferAsr !== false;
+
+    if (format) {
+      if (!signedSet.has('fmt') || !url.searchParams.get('fmt')) {
+        url.searchParams.set('fmt', format);
+      }
+    }
+
+    setTimedtextParamDefault(url, signedSet, 'hl', language);
+    setTimedtextParamDefault(url, signedSet, 'lang', language);
+    if (preferAsr) {
+      setTimedtextParamDefault(url, signedSet, 'caps', 'asr');
+    }
+    setTimedtextParamDefault(url, signedSet, 'exp', 'xpe');
+    setTimedtextParamDefault(url, signedSet, 'xoaf', '5');
+    setTimedtextParamDefault(url, signedSet, 'xowf', '1');
+    setTimedtextParamDefault(url, signedSet, 'xospf', '1');
+    setTimedtextParamDefault(url, signedSet, 'ip', '0.0.0.0');
+    setTimedtextParamDefault(url, signedSet, 'ipbits', '0');
+    setTimedtextParamDefault(url, signedSet, 'key', 'yt8');
+    return url.toString();
+  } catch (_) {
+    return merged;
   }
 }
 
@@ -1691,10 +1805,11 @@ function htmlReasonToMessage(reason) {
   return '字幕请求返回了 HTML 页面';
 }
 
-function buildTimedtextFormatUrl(baseUrl, format) {
-  const url = new URL(baseUrl);
-  url.searchParams.set('fmt', format);
-  return url.toString();
+function buildTimedtextFormatUrl(baseUrl, format, options = {}) {
+  return buildCanonicalTimedtextUrl(baseUrl, {
+    ...options,
+    format
+  });
 }
 
 function normalizeSubtitleStatus(status) {
@@ -2003,7 +2118,11 @@ async function loadYoutubeSubtitlesImpl(payload, sender) {
   const candidates = [];
   if (track?.baseUrl) {
     candidates.push({
-      baseUrl: track.baseUrl,
+      baseUrl: buildCanonicalTimedtextUrl(track.baseUrl, {
+        language: track.languageCode || languageCode || 'en',
+        preferAsr: true,
+        donorUrl: fallbackUrl || ''
+      }),
       language: track.languageCode,
       isAutoGenerated: track.isAsr,
       source: 'PLAYER_RESPONSE'
@@ -2012,7 +2131,10 @@ async function loadYoutubeSubtitlesImpl(payload, sender) {
   if (fallbackUrl) {
     if (!fallbackInfo.isExpired) {
       candidates.push({
-        baseUrl: fallbackUrl,
+        baseUrl: buildCanonicalTimedtextUrl(fallbackUrl, {
+          language: fallbackInfo.language || languageCode || 'en',
+          preferAsr: true
+        }),
         language: fallbackInfo.language,
         isAutoGenerated: fallbackInfo.isAutoGenerated,
         source: 'PERF_ENTRY'
@@ -2056,8 +2178,20 @@ async function loadYoutubeSubtitlesImpl(payload, sender) {
   });
 
   uniqueCandidates.sort((a, b) => {
-    const rank = (source) => (String(source || '') === 'PLAYER_RESPONSE' ? 0 : 1);
-    return rank(a?.source) - rank(b?.source);
+    const score = (candidate) => {
+      const sourceRank = String(candidate?.source || '') === 'PLAYER_RESPONSE' ? 6 : 0;
+      const summary = summarizeTimedtextUrlForDebug(candidate?.baseUrl || '');
+      return (
+        sourceRank +
+        (summary?.hasSignature ? 5 : 0) +
+        (summary?.hasPot ? 3 : 0) +
+        (summary?.ei ? 2 : 0) +
+        (summary?.opi ? 1 : 0) +
+        (summary?.hasExpire && !summary?.isExpired ? 1 : 0) +
+        (summary?.isNearExpiry ? -2 : 0)
+      );
+    };
+    return score(b) - score(a);
   });
 
   debugLog.candidates = uniqueCandidates.map((candidate, index) => ({
@@ -2143,11 +2277,18 @@ async function loadYoutubeSubtitlesImpl(payload, sender) {
 
   const bgFallbackStart = Date.now();
   for (const candidate of uniqueCandidates) {
-    const vttResult = await fetchSubtitleTextWithRetry(buildTimedtextFormatUrl(candidate.baseUrl, 'vtt'), {
+    const vttResult = await fetchSubtitleTextWithRetry(
+      buildTimedtextFormatUrl(candidate.baseUrl, 'vtt', {
+        language: String(candidate.language || languageCode || 'en').trim() || 'en',
+        preferAsr: true,
+        donorUrl: fallbackUrl || ''
+      }),
+      {
       debugLog,
       format: 'vtt',
       source: 'BG_FETCH_FALLBACK'
-    });
+      }
+    );
     if (vttResult.ok) {
       const parsed = parseVttToSubtitleItems(vttResult.body, videoId);
       if (parsed.length > 0) {
@@ -2175,7 +2316,11 @@ async function loadYoutubeSubtitlesImpl(payload, sender) {
     }
 
     const jsonResult = await fetchSubtitleTextWithRetry(
-      buildTimedtextFormatUrl(candidate.baseUrl, 'json3'),
+      buildTimedtextFormatUrl(candidate.baseUrl, 'json3', {
+        language: String(candidate.language || languageCode || 'en').trim() || 'en',
+        preferAsr: true,
+        donorUrl: fallbackUrl || ''
+      }),
       {
         debugLog,
         format: 'json3',

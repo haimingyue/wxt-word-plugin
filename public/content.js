@@ -3208,16 +3208,60 @@ function pickPreferredCaptionTrack(tracks = []) {
   return manual || normalized[0];
 }
 
+function getTimedtextSignedParamSet(searchParams) {
+  const raw = String(searchParams?.get?.('sparams') || '')
+    .split(',')
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+  return new Set(raw);
+}
+
+function setTimedtextDefaultParam(url, signedParams, key, value) {
+  if (!url || !key) return;
+  if (url.searchParams.has(key)) return;
+  if (signedParams?.has?.(key)) return;
+  const safeValue = String(value || '').trim();
+  if (!safeValue) return;
+  url.searchParams.set(key, safeValue);
+}
+
+function buildTimedtextRequestUrl(baseUrl, { format = '', language = 'en', preferAsr = true } = {}) {
+  try {
+    const url = new URL(baseUrl, location.origin);
+    const signedParams = getTimedtextSignedParamSet(url.searchParams);
+    const targetLang = String(language || url.searchParams.get('lang') || 'en').trim() || 'en';
+
+    const cleanFormat = String(format || '').trim().toLowerCase();
+    if (cleanFormat) {
+      if (!signedParams.has('fmt') || !url.searchParams.get('fmt')) {
+        url.searchParams.set('fmt', cleanFormat);
+      }
+    }
+
+    setTimedtextDefaultParam(url, signedParams, 'hl', targetLang);
+    setTimedtextDefaultParam(url, signedParams, 'lang', targetLang);
+    if (preferAsr) {
+      setTimedtextDefaultParam(url, signedParams, 'caps', 'asr');
+    }
+    setTimedtextDefaultParam(url, signedParams, 'exp', 'xpe');
+    setTimedtextDefaultParam(url, signedParams, 'xoaf', '5');
+    setTimedtextDefaultParam(url, signedParams, 'xowf', '1');
+    setTimedtextDefaultParam(url, signedParams, 'xospf', '1');
+    setTimedtextDefaultParam(url, signedParams, 'ip', '0.0.0.0');
+    setTimedtextDefaultParam(url, signedParams, 'ipbits', '0');
+    setTimedtextDefaultParam(url, signedParams, 'key', 'yt8');
+    return url.toString();
+  } catch (_) {
+    return String(baseUrl || '').trim();
+  }
+}
+
 function buildCaptionJsonUrl(baseUrl) {
-  const url = new URL(baseUrl, location.origin);
-  url.searchParams.set('fmt', 'json3');
-  return url.toString();
+  return buildTimedtextRequestUrl(baseUrl, { format: 'json3', language: 'en', preferAsr: true });
 }
 
 function buildCaptionVttUrl(baseUrl) {
-  const url = new URL(baseUrl, location.origin);
-  url.searchParams.set('fmt', 'vtt');
-  return url.toString();
+  return buildTimedtextRequestUrl(baseUrl, { format: 'vtt', language: 'en', preferAsr: true });
 }
 
 async function fetchCaptionEvents(track) {
