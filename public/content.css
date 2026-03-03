@@ -131,6 +131,7 @@
 #deepseek-meaning-panel {
   position: fixed;
   z-index: 2147483646;
+  --deepseek-theme-color: #2563eb;
   width: min(390px, 92vw);
   max-height: 80vh;
   overflow: auto;
@@ -162,6 +163,18 @@
   font-size: 14px;
   font-weight: 600;
   color: #111827;
+}
+
+#deepseek-meaning-panel .deepseek-panel__phonetic {
+  margin-top: 2px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--deepseek-theme-color);
+  letter-spacing: 0.2px;
+}
+
+#deepseek-meaning-panel .deepseek-panel__phonetic.is-empty {
+  display: none;
 }
 
 #deepseek-meaning-panel .deepseek-panel__sentence {

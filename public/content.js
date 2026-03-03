@@ -426,7 +426,8 @@ async function startMeaningCapture(prefilledSelection) {
 }
 
 function initAutoPopupOnSelection() {
-  const trigger = () => {
+  const trigger = (event) => {
+    if (isEventInsideExtensionUi(event)) return;
     window.setTimeout(() => {
       maybeAutoPopupMeaning();
     }, 0);
@@ -435,7 +436,21 @@ function initAutoPopupOnSelection() {
   document.addEventListener('keyup', trigger);
 }
 
+function isEventInsideExtensionUi(event) {
+  const target = event?.target;
+  if (!target || typeof target.closest !== 'function') return false;
+  const selector = [
+    `#${PANEL_ID}`,
+    `#${MEANING_PANEL_ID}`,
+    `#${YT_RT_PANEL_ID}`,
+    `#${YT_RT_OVERLAY_ID}`,
+    `#${YT_RT_REOPEN_BTN_ID}`
+  ].join(',');
+  return Boolean(target.closest(selector));
+}
+
 function maybeAutoPopupMeaning() {
+  if (document.getElementById(MEANING_PANEL_ID)) return;
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed) return;
   if (selection.rangeCount < 1) return;
@@ -994,6 +1009,7 @@ function openMeaningPanel(data, rect, options = {}) {
       <button class="deepseek-btn" data-close>×</button>
     </div>
     <div class="deepseek-panel__word">${escapeHtml(data.word)}</div>
+    <div class="deepseek-panel__phonetic is-empty" data-phonetic></div>
     <div class="deepseek-panel__sentence">${escapeHtml(data.sentence)}</div>
     <div class="deepseek-panel__result deepseek-panel__result--meaning" data-meaning>${escapeHtml(meaningPlaceholder)}</div>
     ${translationResultHtml}
@@ -1081,6 +1097,7 @@ function openMeaningPanel(data, rect, options = {}) {
 
   document.body.appendChild(panel);
   positionMeaningPanel(panel, rect, options);
+  updatePanelPhonetic(panel, data?.phonetic || '');
   if (skipMeaning) {
     const meaningEl = panel.querySelector('[data-meaning]');
     if (meaningEl) {
@@ -1133,6 +1150,33 @@ function normalizeMeaningDisplay(raw) {
   return text.replace(/^释义\s*[:：]?\s*/i, '');
 }
 
+function normalizePhoneticDisplay(raw) {
+  const text = String(raw || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return '';
+  if (
+    (text.startsWith('/') && text.endsWith('/')) ||
+    (text.startsWith('[') && text.endsWith(']'))
+  ) {
+    return text;
+  }
+  return `/${text}/`;
+}
+
+function updatePanelPhonetic(panel, rawPhonetic) {
+  const phoneticEl = panel?.querySelector?.('[data-phonetic]');
+  if (!phoneticEl) return;
+  const display = normalizePhoneticDisplay(rawPhonetic);
+  if (!display) {
+    phoneticEl.textContent = '';
+    phoneticEl.classList.add('is-empty');
+    return;
+  }
+  phoneticEl.textContent = display;
+  phoneticEl.classList.remove('is-empty');
+}
+
 function requestEcdictMeaning(panel, data) {
   const resultEl = panel.querySelector('[data-dictionary]');
   if (!resultEl) return;
@@ -1154,6 +1198,7 @@ function requestEcdictMeaning(panel, data) {
       }
       if (res?.success) {
         panel._ecdictEntry = res.entry || null;
+        updatePanelPhonetic(panel, res?.entry?.phonetic || '');
         if (res?.meaning) {
           resultEl.textContent = res.meaning;
           resultEl.classList.remove('is-error', 'is-muted');
