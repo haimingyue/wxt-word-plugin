@@ -908,3 +908,38 @@ ytd-watch-flexy.yt-rt-hide-native-captions .ytp-caption-window-rollup {
   visibility: hidden !important;
   opacity: 0 !important;
 }
+
+.extra-word-page-translation {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 8px 0 0;
+  box-sizing: border-box;
+  color: #6b7280;
+  font-size: 0.94em;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.extra-word-page-translation-spinner {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  margin-left: 0.42em;
+  vertical-align: -0.08em;
+  border: 2px solid rgba(148, 163, 184, 0.28);
+  border-top-color: rgba(59, 130, 246, 0.92);
+  border-radius: 999px;
+  box-sizing: border-box;
+  animation: extra-word-page-translation-spin 0.72s linear infinite;
+}
+
+@keyframes extra-word-page-translation-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}

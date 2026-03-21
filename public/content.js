@@ -1,6 +1,7 @@
 const PANEL_ID = 'anki-example-panel';
 const TOAST_ID = 'anki-example-toast';
 const MEANING_PANEL_ID = 'deepseek-meaning-panel';
+const EXTENSION_PREFS_STORAGE_KEY = 'extraWordPrefsV1';
 const MEANING_MAX_LEN = 64;
 const AUDIO_WAVES_ICON = chrome.runtime.getURL('assets/audio-waves.png');
 const AUTO_POPUP_COOLDOWN_MS = 600;
@@ -77,6 +78,8 @@ const YT_RT_PREFETCH_RETRY_COOLDOWN_MS = 1600;
 const YT_RT_BACKFILL_RETRY_LONG_COOLDOWN_MS = 5000;
 const YT_RT_REASON_LOG_DEDUP_MS = 1400;
 const YT_RT_REASON_LOG_MAX = 1200;
+const PAGE_TRANSLATION_VIEWPORT_MARGIN_PX = 360;
+const PAGE_TRANSLATION_SCROLL_DEBOUNCE_MS = 180;
 const YT_RT_FLAG_COLD_START_SKIP_COUNT_KEY = 'ytRtColdStartSkipCount';
 const YT_RT_FLAG_FAST_LANE_VARIABLE_BATCH_KEY = 'ytRtFastLaneVariableBatchEnabled';
 const YT_RT_FLAG_BACKFILL_TIMESLICE_KEY = 'ytRtBackfillTimesliceEnabled';
@@ -91,6 +94,13 @@ const YT_RT_FLAG_RIGHT_PANEL_SHOW_TRANSLATION_KEY = 'ytRtRightPanelShowTranslati
 let preferredTtsAccent = 'us';
 let lastAutoPopupSelection = '';
 let lastAutoPopupAt = 0;
+let selectionMeaningEnabled = true;
+let pageTranslationInFlight = false;
+let pageTranslationApplied = false;
+const pageTranslationRecords = [];
+let pageTranslationModeEnabled = false;
+let pageTranslationScrollTimer = 0;
+let pageTranslationScrollBound = false;
 let ytRtObserver = null;
 let ytRtRouteKey = '';
 let ytRtDebounceTimer = 0;
@@ -165,6 +175,7 @@ let dictRequestId = 0;
 let parseRequestId = 0;
 
 ytRtEnabled = loadRealtimeEnabledPreference();
+loadExtensionPrefs().catch(() => {});
 
 function getFlagRawValue(key) {
   try {
@@ -209,6 +220,32 @@ function persistRealtimeEnabledPreference(enabled) {
   try {
     localStorage.setItem(YT_RT_ENABLED_STORAGE_KEY, enabled ? '1' : '0');
   } catch (_) {}
+}
+
+async function loadExtensionPrefs() {
+  try {
+    const stored = await chrome.storage.local.get(EXTENSION_PREFS_STORAGE_KEY);
+    const prefs = stored?.[EXTENSION_PREFS_STORAGE_KEY];
+    selectionMeaningEnabled = prefs?.selectionMeaningEnabled !== false;
+  } catch (_) {
+    selectionMeaningEnabled = true;
+  }
+  return {
+    selectionMeaningEnabled
+  };
+}
+
+async function saveExtensionPrefs(partialPrefs = {}) {
+  const current = await loadExtensionPrefs();
+  const next = {
+    ...current,
+    ...partialPrefs
+  };
+  selectionMeaningEnabled = next.selectionMeaningEnabled !== false;
+  await chrome.storage.local.set({
+    [EXTENSION_PREFS_STORAGE_KEY]: next
+  });
+  return next;
 }
 
 function isFastLaneVariableBatchEnabled() {
@@ -582,7 +619,7 @@ function speakText(text, triggerBtn, options = {}) {
   window.speechSynthesis.speak(utterance);
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'trigger-capture') {
     if (!document.hasFocus() && !msg.selectionText) return;
     startCapture(msg.selectionText);
@@ -602,6 +639,41 @@ chrome.runtime.onMessage.addListener((msg) => {
 
   if (msg?.type === 'trigger-ecdict-lookup') {
     startEcdictLookup(msg.selectionText);
+  }
+
+  if (msg?.type === 'extension-get-state') {
+    Promise.resolve(loadExtensionPrefs())
+      .then((prefs) =>
+        sendResponse({
+          success: true,
+          prefs,
+          pageTranslated: pageTranslationModeEnabled,
+          pageTranslationInFlight
+        })
+      )
+      .catch((err) => sendResponse({ success: false, message: normalizeExtensionError(err) }));
+    return true;
+  }
+
+  if (msg?.type === 'extension-set-prefs') {
+    Promise.resolve(saveExtensionPrefs(msg.payload || {}))
+      .then((prefs) => sendResponse({ success: true, prefs }))
+      .catch((err) => sendResponse({ success: false, message: normalizeExtensionError(err) }));
+    return true;
+  }
+
+  if (msg?.type === 'extension-translate-page') {
+    Promise.resolve(translateCurrentPage())
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((err) => sendResponse({ success: false, message: normalizeExtensionError(err) }));
+    return true;
+  }
+
+  if (msg?.type === 'extension-restore-page') {
+    Promise.resolve(restoreTranslatedPage())
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((err) => sendResponse({ success: false, message: normalizeExtensionError(err) }));
+    return true;
   }
 });
 
@@ -692,6 +764,7 @@ function isEventInsideExtensionUi(event) {
 }
 
 function maybeAutoPopupMeaning() {
+  if (!selectionMeaningEnabled) return;
   if (document.getElementById(MEANING_PANEL_ID)) return;
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed) return;
@@ -1895,6 +1968,295 @@ function safeSendMessageAsync(message) {
       resolve(res);
     });
   });
+}
+
+function shouldSkipPageTranslateElement(element) {
+  if (!element || !(element instanceof Element)) return true;
+  if (
+    element.closest?.(
+      `#${PANEL_ID},#${MEANING_PANEL_ID},#${YT_RT_PANEL_ID},#${YT_RT_OVERLAY_ID},#${YT_RT_REOPEN_BTN_ID},#${YT_RT_TOGGLE_ID}`
+    )
+  ) {
+    return true;
+  }
+  if (
+    element.closest?.(
+      'header,nav,footer,aside,dialog,menu,[role="navigation"],[role="banner"],[role="toolbar"],[role="menubar"],[role="menu"],[role="dialog"],[aria-label*="nav" i],[aria-label*="menu" i]'
+    )
+  ) {
+    return true;
+  }
+  const tag = String(element.tagName || '').toLowerCase();
+  if (
+    [
+      'script',
+      'style',
+      'noscript',
+      'textarea',
+      'input',
+      'select',
+      'option',
+      'button',
+      'code',
+      'pre',
+      'kbd',
+      'samp',
+      'svg',
+      'canvas'
+    ].includes(tag)
+  ) {
+    return true;
+  }
+  if (element.isContentEditable) return true;
+  return false;
+}
+
+function normalizePageTranslationText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function getElementOwnTranslatableText(element) {
+  if (!element || !(element instanceof HTMLElement)) return '';
+  const clone = element.cloneNode(true);
+  if (!(clone instanceof HTMLElement)) {
+    return normalizePageTranslationText(element.innerText || element.textContent || '');
+  }
+  clone
+    .querySelectorAll('.extra-word-page-translation,.extra-word-page-translation-spinner,[data-extra-word-translated="1"]')
+    .forEach((node) => node.remove());
+  return normalizePageTranslationText(clone.innerText || clone.textContent || '');
+}
+
+function isPageTranslationCandidateElement(element) {
+  if (!element || !(element instanceof HTMLElement)) return false;
+  if (shouldSkipPageTranslateElement(element)) return false;
+  if (element.dataset.extraWordTranslated === '1') return false;
+  if (element.dataset.extraWordTranslationPending === '1') return false;
+  if (element.querySelector?.('.extra-word-page-translation')) return false;
+  if (element.childElementCount > 6) return false;
+  const tag = String(element.tagName || '').toLowerCase();
+  const allowedTags = ['p', 'li', 'blockquote', 'figcaption', 'summary', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
+  if (!allowedTags.includes(tag)) return false;
+  const text = getElementOwnTranslatableText(element);
+  if (!text || text.length < 6) return false;
+  if (!/[A-Za-z]/.test(text)) return false;
+  if (text.length > 1800) return false;
+  return true;
+}
+
+function collectTranslatableBlocks(root = document.body) {
+  if (!root) return [];
+  const candidates = Array.from(root.querySelectorAll('p,li,blockquote,figcaption,summary,td,th,h1,h2,h3,h4,h5,h6')).sort(
+    (a, b) => getElementDepth(b) - getElementDepth(a)
+  );
+  const records = [];
+  const seen = new Set();
+  candidates.forEach((element) => {
+    if (!isPageTranslationCandidateElement(element)) return;
+    if (records.some((record) => record.element.contains(element) || element.contains(record.element))) return;
+    const text = getElementOwnTranslatableText(element);
+    if (!text) return;
+    const dedupeKey = `${text.slice(0, 120)}|${Math.round(element.getBoundingClientRect().top)}`;
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+    records.push({
+      element,
+      normalized: text
+    });
+  });
+  return records;
+}
+
+function getElementDepth(element) {
+  let depth = 0;
+  let current = element;
+  while (current?.parentElement) {
+    depth += 1;
+    current = current.parentElement;
+  }
+  return depth;
+}
+
+function isElementInsideTranslationViewport(element, margin = PAGE_TRANSLATION_VIEWPORT_MARGIN_PX) {
+  if (!element || !(element instanceof HTMLElement) || !element.isConnected) return false;
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+  return rect.bottom >= -margin && rect.top <= viewportHeight + margin;
+}
+
+function collectViewportTranslatableBlocks(root = document.body) {
+  return collectTranslatableBlocks(root).filter((record) =>
+    isElementInsideTranslationViewport(record?.element)
+  );
+}
+
+function buildPageTranslationGroups(records) {
+  const groups = [];
+  let current = [];
+  let currentChars = 0;
+  records.forEach((record) => {
+    const text = String(record?.normalized || '');
+    if (!text) return;
+    if (current.length > 0 && (current.length >= 12 || currentChars + text.length > 1200)) {
+      groups.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(record);
+    currentChars += text.length;
+  });
+  if (current.length) groups.push(current);
+  return groups;
+}
+
+function ensurePageTranslationSpinner(record) {
+  const element = record?.element;
+  if (!element || !element.isConnected) return null;
+  if (record.spinnerEl?.isConnected) return record.spinnerEl;
+  element.dataset.extraWordTranslationPending = '1';
+  const spinnerEl = document.createElement('span');
+  spinnerEl.className = 'extra-word-page-translation-spinner';
+  spinnerEl.setAttribute('aria-hidden', 'true');
+  element.appendChild(spinnerEl);
+  record.spinnerEl = spinnerEl;
+  return spinnerEl;
+}
+
+function clearPageTranslationSpinner(record) {
+  if (!record) return;
+  if (record.element instanceof HTMLElement) {
+    delete record.element.dataset.extraWordTranslationPending;
+  }
+  record.spinnerEl?.remove?.();
+  record.spinnerEl = null;
+}
+
+function bindPageTranslationViewportListeners() {
+  if (pageTranslationScrollBound) return;
+  pageTranslationScrollBound = true;
+  window.addEventListener('scroll', scheduleViewportTranslationRefresh, { passive: true });
+  window.addEventListener('resize', scheduleViewportTranslationRefresh, { passive: true });
+}
+
+function unbindPageTranslationViewportListeners() {
+  if (!pageTranslationScrollBound) return;
+  pageTranslationScrollBound = false;
+  window.removeEventListener('scroll', scheduleViewportTranslationRefresh);
+  window.removeEventListener('resize', scheduleViewportTranslationRefresh);
+}
+
+function scheduleViewportTranslationRefresh() {
+  if (!pageTranslationModeEnabled) return;
+  if (pageTranslationScrollTimer) {
+    clearTimeout(pageTranslationScrollTimer);
+  }
+  pageTranslationScrollTimer = window.setTimeout(() => {
+    pageTranslationScrollTimer = 0;
+    if (!pageTranslationModeEnabled || pageTranslationInFlight) return;
+    translateVisiblePageBlocks().catch(() => {});
+  }, PAGE_TRANSLATION_SCROLL_DEBOUNCE_MS);
+}
+
+async function translateVisiblePageBlocks() {
+  const root = document.body;
+  if (!root) return { pageTranslated: pageTranslationModeEnabled, count: pageTranslationRecords.length };
+  const records = collectViewportTranslatableBlocks(root);
+  if (!records.length) {
+    return { pageTranslated: pageTranslationModeEnabled, count: pageTranslationRecords.length };
+  }
+
+  pageTranslationInFlight = true;
+  try {
+    const groups = buildPageTranslationGroups(records);
+    for (const group of groups) {
+      group.forEach((record) => ensurePageTranslationSpinner(record));
+      const texts = group.map((item) => item.normalized);
+      let translated = await requestRealtimeGroupedTranslationWithTimeout(texts, 12000);
+      if (translated.length !== texts.length) {
+        translated = await requestRealtimeBatchTranslationWithTimeout(texts, 12000);
+      }
+      if (translated.length !== texts.length) {
+        group.forEach((record) => clearPageTranslationSpinner(record));
+        continue;
+      }
+      group.forEach((record, index) => {
+        const applied = applyTranslatedTextRecord(record, translated[index]);
+        if (applied) pageTranslationRecords.push(record);
+      });
+    }
+    pageTranslationApplied = pageTranslationRecords.length > 0;
+    return {
+      pageTranslated: pageTranslationModeEnabled,
+      count: pageTranslationRecords.length
+    };
+  } finally {
+    pageTranslationInFlight = false;
+  }
+}
+
+function applyTranslatedTextRecord(record, translatedText) {
+  const element = record?.element;
+  if (!element || !element.isConnected) return false;
+  const translated = String(translatedText || '').trim();
+  if (!translated) return false;
+  clearPageTranslationSpinner(record);
+  const translationEl = document.createElement('div');
+  translationEl.className = 'extra-word-page-translation';
+  translationEl.textContent = translated;
+  element.dataset.extraWordTranslated = '1';
+  element.style.overflowWrap = 'anywhere';
+  element.style.wordBreak = 'break-word';
+  translationEl.style.overflowWrap = 'anywhere';
+  translationEl.style.wordBreak = 'break-word';
+  element.insertAdjacentElement('afterend', translationEl);
+  record.translationEl = translationEl;
+  return true;
+}
+
+async function translateCurrentPage() {
+  if (pageTranslationInFlight) {
+    return { pageTranslated: pageTranslationModeEnabled, count: pageTranslationRecords.length };
+  }
+  if (pageTranslationModeEnabled) {
+    return restoreTranslatedPage();
+  }
+
+  const root = document.body;
+  if (!root) {
+    throw new Error('页面主体不可用');
+  }
+  const records = collectViewportTranslatableBlocks(root);
+  if (!records.length) {
+    return { pageTranslated: false, count: 0 };
+  }
+  pageTranslationModeEnabled = true;
+  bindPageTranslationViewportListeners();
+  return translateVisiblePageBlocks();
+}
+
+async function restoreTranslatedPage() {
+  pageTranslationRecords.forEach((record) => {
+    const element = record?.element;
+    if (element instanceof HTMLElement) {
+      delete element.dataset.extraWordTranslated;
+    }
+    clearPageTranslationSpinner(record);
+    record?.translationEl?.remove?.();
+  });
+  pageTranslationRecords.length = 0;
+  pageTranslationApplied = false;
+  pageTranslationModeEnabled = false;
+  pageTranslationInFlight = false;
+  if (pageTranslationScrollTimer) {
+    clearTimeout(pageTranslationScrollTimer);
+    pageTranslationScrollTimer = 0;
+  }
+  unbindPageTranslationViewportListeners();
+  return {
+    pageTranslated: false,
+    count: 0
+  };
 }
 
 function isLikelyHtmlResponse(contentType, rawText) {

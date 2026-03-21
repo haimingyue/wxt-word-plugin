@@ -1,53 +1,243 @@
 body {
-  width: 320px;
+  width: 360px;
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  color: #0f172a;
+  background: #f7f7fb;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #1e293b;
 }
 
 .popup {
+  padding: 16px;
+}
+
+.popup__hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.popup__eyebrow {
+  font-size: 12px;
+  font-weight: 700;
+  color: #ec4899;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.popup__title {
+  margin: 4px 0 6px;
+  font-size: 28px;
+  line-height: 1.1;
+  color: #172554;
+}
+
+.popup__desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #64748b;
+}
+
+.ghost-btn,
+.soft-btn,
+.primary-btn {
+  border: 0;
+  border-radius: 16px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+}
+
+.ghost-btn {
+  padding: 10px 14px;
+  background: #fff;
+  color: #475569;
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.22);
+}
+
+.ghost-btn:hover,
+.soft-btn:hover,
+.primary-btn:hover {
+  transform: translateY(-1px);
+}
+
+.popup__panel,
+.popup__tips {
+  background: #fff;
+  border-radius: 24px;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+}
+
+.popup__panel {
   padding: 14px;
 }
 
-h1 {
-  margin: 0 0 6px;
-  font-size: 18px;
-}
-
-.desc {
-  margin: 0 0 10px;
-  font-size: 13px;
-  color: #475569;
-}
-
-.actions {
+.panel__header {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
-button {
-  flex: 1;
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid #d0d7de;
-  background: #2563eb;
-  color: #fff;
-  cursor: pointer;
-  font-size: 13px;
+.panel__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f172a;
 }
 
-button:hover {
-  background: #1e4fc4;
-}
-
-.status {
-  font-size: 13px;
-  margin-bottom: 8px;
-}
-
-.hint {
-  font-size: 12px;
+.status-badge {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #f1f5f9;
   color: #475569;
+  font-size: 12px;
+  font-weight: 600;
 }
 
+.status-badge.is-success {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-badge.is-busy {
+  background: #fdf2f8;
+  color: #be185d;
+}
+
+.status-badge.is-error {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 0;
+}
+
+.toggle-row + .toggle-row {
+  border-top: 1px solid #eef2f7;
+}
+
+.toggle-row__content {
+  min-width: 0;
+}
+
+.toggle-row__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.toggle-row__desc {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #64748b;
+}
+
+.switch {
+  position: relative;
+  width: 48px;
+  height: 28px;
+  flex: 0 0 auto;
+}
+
+.switch input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  margin: 0;
+}
+
+.switch__track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: #d1d5db;
+  transition: background 0.18s ease;
+}
+
+.switch__thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);
+  transition: transform 0.18s ease;
+}
+
+.switch input:checked + .switch__track {
+  background: #ec4899;
+}
+
+.switch input:checked + .switch__track + .switch__thumb {
+  transform: translateX(20px);
+}
+
+.primary-actions,
+.secondary-actions {
+  display: flex;
+  margin-top: 14px;
+}
+
+.primary-btn {
+  width: 100%;
+  padding: 16px 18px;
+  background: #ec4899;
+  color: #fff;
+  box-shadow: 0 12px 24px rgba(236, 72, 153, 0.28);
+}
+
+.primary-btn.is-restoring {
+  background: #475569;
+  box-shadow: 0 12px 24px rgba(71, 85, 105, 0.24);
+}
+
+.soft-btn {
+  width: 100%;
+  padding: 12px 14px;
+  background: #f8fafc;
+  color: #334155;
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.22);
+}
+
+.ghost-btn:disabled,
+.soft-btn:disabled,
+.primary-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.popup__tips {
+  margin-top: 12px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.tips__item {
+  display: grid;
+  gap: 4px;
+}
+
+.tips__label {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.tips__value {
+  font-size: 13px;
+  line-height: 1.45;
+  color: #334155;
+}

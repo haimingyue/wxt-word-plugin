@@ -3,25 +3,57 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Anki Example Collector</title>
-    
+    <title>Extra Word</title>
   </head>
   <body>
     <main class="popup">
-      <h1>Anki Example Collector</h1>
-      <p class="desc">选中单词后按 Ctrl+Shift+L 或右键发送句子到 Anki。</p>
+      <section class="popup__hero">
+        <div>
+          <div class="popup__eyebrow">Extra Word</div>
+          <h1 class="popup__title">网页翻译与划词释义</h1>
+          <p class="popup__desc">支持划词弹出释义，也可以一键翻译当前网站并恢复原文。</p>
+        </div>
+        <button id="btn-options" class="ghost-btn" type="button">设置</button>
+      </section>
 
-      <div class="actions">
-        <button id="btn-options">打开设置</button>
-        <button id="btn-ping">测试 AnkiConnect</button>
-      </div>
+      <section class="popup__panel">
+        <div class="panel__header">
+          <span class="panel__title">快捷开关</span>
+          <span id="status-badge" class="status-badge">待命</span>
+        </div>
 
-      <div id="status" class="status">状态：等待操作</div>
-      <div class="hint">默认字段：Word / Example / Source，牌组选 Default，模板 Basic。</div>
+        <label class="toggle-row" for="toggle-selection-meaning">
+          <div class="toggle-row__content">
+            <div class="toggle-row__title">划词释义</div>
+            <div class="toggle-row__desc">开启后，选中英文单词会自动弹出释义框。</div>
+          </div>
+          <span class="switch">
+            <input id="toggle-selection-meaning" type="checkbox" />
+            <span class="switch__track"></span>
+            <span class="switch__thumb"></span>
+          </span>
+        </label>
+
+        <div class="primary-actions">
+          <button id="btn-translate-page" class="primary-btn" type="button">翻译当前网站</button>
+        </div>
+
+        <div class="secondary-actions">
+          <button id="btn-ping" class="soft-btn" type="button">测试 AnkiConnect</button>
+        </div>
+      </section>
+
+      <section class="popup__tips">
+        <div class="tips__item">
+          <div class="tips__label">当前网站</div>
+          <div id="page-state" class="tips__value">未翻译</div>
+        </div>
+        <div class="tips__item">
+          <div class="tips__label">默认行为</div>
+          <div class="tips__value">选中单词自动释义，支持恢复原文</div>
+        </div>
+      </section>
     </main>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>
-
-
-
