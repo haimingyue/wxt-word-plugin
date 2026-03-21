@@ -7,6 +7,7 @@ const AUTO_POPUP_COOLDOWN_MS = 600;
 const YT_RT_PANEL_ID = 'yt-rt-translate-panel';
 const YT_RT_OVERLAY_ID = 'yt-rt-translate-overlay';
 const YT_RT_REOPEN_BTN_ID = 'yt-rt-translate-reopen-btn';
+const YT_RT_TOGGLE_ID = 'yt-rt-toggle-btn';
 const YT_RT_WATCH_ACTIVE_CLASS = 'yt-rt-vertical-view-active';
 const YT_RT_TARGET_FULL_CLASS = 'yt-rt-target-full-bleed';
 const YT_RT_TARGET_PLAYER_FULL_CLASS = 'yt-rt-target-player-full-bleed';
@@ -29,6 +30,7 @@ const YT_RT_AD_RETRY_MS = 1500;
 const YT_RT_HTML_RETRY_COOLDOWN_MS = 6000;
 const YT_RT_HTML_HARD_COOLDOWN_MS = 30000;
 const YT_RT_OVERLAY_POS_KEY = 'yt-rt-overlay-pos-v2';
+const YT_RT_ENABLED_STORAGE_KEY = 'yt-rt-enabled-v1';
 const YT_RT_FAST_PREFETCH_AHEAD = 1;
 const YT_RT_FAST_TIMEOUT_MS = 4200;
 const YT_RT_ACTIVE_PREFETCH_AHEAD = 1;
@@ -162,6 +164,8 @@ let translationRequestId = 0;
 let dictRequestId = 0;
 let parseRequestId = 0;
 
+ytRtEnabled = loadRealtimeEnabledPreference();
+
 function getFlagRawValue(key) {
   try {
     return localStorage.getItem(key);
@@ -190,6 +194,21 @@ function getRealtimeColdStartSkipCount() {
     min: 0,
     max: 10
   });
+}
+
+function loadRealtimeEnabledPreference() {
+  try {
+    const raw = localStorage.getItem(YT_RT_ENABLED_STORAGE_KEY);
+    if (raw === '0') return false;
+    if (raw === '1') return true;
+  } catch (_) {}
+  return true;
+}
+
+function persistRealtimeEnabledPreference(enabled) {
+  try {
+    localStorage.setItem(YT_RT_ENABLED_STORAGE_KEY, enabled ? '1' : '0');
+  } catch (_) {}
 }
 
 function isFastLaneVariableBatchEnabled() {
@@ -2325,6 +2344,7 @@ function syncRealtimePanelLayout() {
     }
     syncNativeCaptionVisibility();
     syncRealtimeOverlayLayout();
+    syncRealtimeToggleLayout();
     return;
   }
   const fullBleedContainer = document.getElementById('full-bleed-container');
@@ -2389,6 +2409,7 @@ function syncRealtimePanelLayout() {
   }
   syncNativeCaptionVisibility();
   syncRealtimeOverlayLayout();
+  syncRealtimeToggleLayout();
 }
 
 function teardownRealtimeSubtitleObserver() {
@@ -2551,6 +2572,80 @@ function syncRealtimeOverlayLayout() {
     document.body.appendChild(overlay);
   }
   applyRealtimeOverlayPos();
+}
+
+function getRealtimeToggleAnchorContainer() {
+  const candidates = [
+    document.querySelector('.html5-video-player .ytp-left-controls'),
+    document.querySelector('#movie_player .ytp-left-controls'),
+    document.querySelector('.html5-video-player .ytp-right-controls'),
+    document.querySelector('#movie_player .ytp-right-controls'),
+    getRealtimeOverlayAnchorContainer()
+  ];
+  return candidates.find((candidate) => isVisibleRealtimeOverlayContainer(candidate)) || null;
+}
+
+function syncRealtimeToggleLayout() {
+  const toggle = document.getElementById(YT_RT_TOGGLE_ID);
+  if (!toggle) return;
+  const container = getRealtimeToggleAnchorContainer();
+  if (container && toggle.parentElement !== container) {
+    toggle.remove();
+    container.appendChild(toggle);
+  } else if (!container && toggle.parentElement !== document.body) {
+    toggle.remove();
+    document.body.appendChild(toggle);
+  }
+}
+
+function updateRealtimeToggleUi() {
+  const toggle = document.getElementById(YT_RT_TOGGLE_ID);
+  if (!toggle) return;
+  const knob = toggle.querySelector('[data-yt-rt-toggle-knob]');
+  const label = toggle.querySelector('[data-yt-rt-toggle-label]');
+  toggle.setAttribute('aria-pressed', ytRtEnabled ? 'true' : 'false');
+  toggle.classList.toggle('is-on', ytRtEnabled);
+  toggle.classList.toggle('is-off', !ytRtEnabled);
+  toggle.title = ytRtEnabled ? '关闭实时翻译' : '开启实时翻译';
+  if (label) {
+    label.textContent = ytRtEnabled ? '实时翻译' : '实时翻译';
+  }
+  if (knob) {
+    knob.textContent = ytRtEnabled ? 'ON' : 'OFF';
+  }
+}
+
+function setRealtimeEnabled(nextEnabled) {
+  const enabled = Boolean(nextEnabled);
+  if (ytRtEnabled === enabled) {
+    updateRealtimeToggleUi();
+    return;
+  }
+  ytRtEnabled = enabled;
+  persistRealtimeEnabledPreference(enabled);
+  updateRealtimeToggleUi();
+
+  const panel = document.getElementById(YT_RT_PANEL_ID);
+  const reopenBtn = document.getElementById(YT_RT_REOPEN_BTN_ID);
+  if (!enabled) {
+    panel?.classList.add('is-hidden');
+    reopenBtn?.classList.remove('is-active');
+    renderRealtimeSubtitleOverlay(null);
+  } else {
+    panel?.classList.remove('is-hidden');
+    reopenBtn?.classList.remove('is-active');
+    if (!ytRtItems.length) {
+      loadRealtimeTranscript(false).catch(() => {});
+    } else {
+      renderRealtimeSubtitleList();
+      syncRealtimeActiveItemByPlayback(true);
+      renderRealtimeSubtitleOverlay(ytRtItems[ytRtActiveIndex] || null);
+    }
+  }
+  syncNativeCaptionVisibility();
+  syncRealtimePanelLayout();
+  syncRealtimeOverlayLayout();
+  syncRealtimeToggleLayout();
 }
 
 function enableRealtimeOverlayDrag(overlay) {
@@ -4932,6 +5027,31 @@ function ensureRealtimeSubtitleUi() {
       }
     });
   }
+
+  let toggleBtn = document.getElementById(YT_RT_TOGGLE_ID);
+  if (!toggleBtn) {
+    toggleBtn = document.createElement('button');
+    toggleBtn.id = YT_RT_TOGGLE_ID;
+    toggleBtn.type = 'button';
+    toggleBtn.className = 'yt-rt-toggle';
+    toggleBtn.innerHTML = `
+      <span class="yt-rt-toggle__label" data-yt-rt-toggle-label></span>
+      <span class="yt-rt-toggle__track">
+        <span class="yt-rt-toggle__knob" data-yt-rt-toggle-knob></span>
+      </span>
+    `;
+    document.body.appendChild(toggleBtn);
+  }
+  if (toggleBtn.dataset.ytRtBound !== '1') {
+    toggleBtn.dataset.ytRtBound = '1';
+    toggleBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setRealtimeEnabled(!ytRtEnabled);
+    });
+  }
+  updateRealtimeToggleUi();
+  syncRealtimeToggleLayout();
 
   syncRealtimePanelLayout();
 
