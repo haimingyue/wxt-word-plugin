@@ -2245,15 +2245,29 @@ function syncNativeCaptionVisibility() {
   watchFlexy?.classList?.toggle(YT_RT_HIDE_NATIVE_CAPTIONS_CLASS, shouldHideNative);
 }
 
+function isVisibleRealtimeOverlayContainer(el) {
+  if (!el) return false;
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden') return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
 function getRealtimeOverlayAnchorContainer() {
-  return (
-    document.getElementById('movie_player') ||
-    document.getElementById('player-full-bleed-container') ||
-    document.getElementById('full-bleed-container') ||
-    document.getElementById('player-container-outer') ||
-    document.getElementById('player') ||
-    null
-  );
+  const video = getCurrentVideoElement();
+  const candidates = [
+    video?.closest?.('.html5-video-container'),
+    video?.parentElement,
+    video?.closest?.('.html5-video-player'),
+    document.querySelector('.html5-video-container'),
+    document.querySelector('.html5-video-player'),
+    document.getElementById('movie_player'),
+    document.getElementById('player-full-bleed-container'),
+    document.getElementById('full-bleed-container'),
+    document.getElementById('player-container-outer'),
+    document.getElementById('player')
+  ];
+  return candidates.find((candidate) => isVisibleRealtimeOverlayContainer(candidate)) || null;
 }
 
 function getRealtimeOverlayPos() {
